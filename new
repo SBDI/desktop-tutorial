@@ -1,0 +1,625 @@
+"""
+Lettrage comptable par optimisation — formulation par colonnes (CP-SAT)
+=========================================================================
+
+OBJECTIF MÉTIER
+----------------
+Regrouper des écritures non lettrées (débits et crédits d'un même compte,
+même devise) en "paquets de lettrage" équilibrés :
+
+  * la somme des montants signés d'un paquet est nulle, ou dans une
+    tolérance donnée (tol = 0 par défaut : lettrage exact) ;
+  * chaque paquet mélange au moins un débit et un crédit ;
+  * une écriture appartient à au plus un paquet (le résiduel — une
+    écriture qui reste non lettrée — est toujours autorisé) ;
+  * on préfère, dans cet ordre :
+      1. lettrer le plus d'écritures possible ;
+      2. des paquets aussi petits que possible (une paire plutôt qu'un
+         quadruplet), sans aucun paramètre de cardinalité à régler ;
+      3. respecter les relations débit/crédit historiques par référence
+         (ex. "la facture FAC23 se lettre habituellement avec le
+         règlement REG23") ;
+      4. des paquets resserrés dans le temps (étendue de dates minimale).
+
+PRINCIPE DE LA FORMULATION PAR COLONNES
+----------------------------------------
+Plutôt que de demander au solveur "dans quel paquet numéroté va chaque
+écriture ?" (formulation par affectation), on énumère D'ABORD, en dehors
+du solveur, tous les paquets CANDIDATS qui pourraient exister — puis on
+demande simplement "quels candidats retient-on ?", sachant qu'une écriture
+ne peut apparaître que dans un seul candidat retenu.
+
+Pourquoi c'est possible sans exploser combinatoirement : une écriture ne
+peut entrer dans un paquet que si elle y est "en relation" avec au moins
+une autre écriture (relation historique connue), sauf les écritures sans
+aucune relation connue, qui ne peuvent former qu'une paire exacte. Cette
+règle métier — la cohérence débit/crédit — élimine d'emblée l'immense
+majorité des regroupements possibles : les seuls candidats à énumérer sont
+les paires isolées et les sous-ensembles des petites "composantes
+connexes" du graphe des relations historiques (typiquement : une facture
+et son règlement, ou un règlement groupé et ses quelques factures).
+
+Résultat mesuré sur données synthétiques (193 écritures, 1 seul appel,
+sans découpage) : optimum prouvé en 0,01 s, contre plusieurs secondes et
+un découpage récursif nécessaire pour la formulation par affectation sur
+le même volume — cf. le comparatif du 13/09/2026.
+
+LIMITE CONNUE
+--------------
+L'énumération suppose que les composantes connexes du graphe des relations
+restent petites (quelques écritures). Une composante anormalement grande
+(référentiel de priors mal nettoyé qui chaîne beaucoup de références) est
+exclue de l'énumération plutôt que de risquer une explosion combinatoire —
+voir `taille_max_composante` dans `ConfigLettrage`. Les écritures ainsi
+exclues sont renvoyées explicitement pour être traitées à part (escalade
+en revue humaine, ou re-découpage en amont).
+
+Le cas des montants dupliqués en masse (des milliers d'écritures isolées
+de montant identique) n'est pas traité ici : il doit être résolu en amont
+par une déduplication avec compteur de multiplicité, comme prévu dans le
+design d'architecture du moteur de lettrage.
+
+ENTRÉES ATTENDUES (une ligne par écriture)
+-------------------------------------------
+  txn_id      : identifiant stable de l'écriture
+  amt_minor   : montant signé en unité mineure (centimes) ; débit > 0,
+                crédit < 0. Jamais de flottant : l'exactitude comptable
+                l'exige.
+  txn_date    : date en entier (jours depuis une origine fixe)
+  ref         : référence normalisée (n° facture, n° règlement...)
+
+Priors : dict {(ref_a, ref_b): poids_entier}, poids > 0 signifiant "ces
+deux références se lettrent habituellement ensemble". Symétrique : les
+clés (a, b) et (b, a) sont équivalentes.
+"""
+
+from __future__ import annotations
+
+import bisect
+from dataclasses import dataclass
+from typing import Iterable
+
+from ortools.sat.python import cp_model
+
+
+# =============================================================================
+# 1. Structures de données
+# =============================================================================
+
+@dataclass(frozen=True)
+class Ecriture:
+    """Une écriture comptable non lettrée."""
+    txn_id: str
+    amt_minor: int      # signé, en centimes ; débit > 0, crédit < 0
+    txn_date: int        # jours depuis une origine fixe
+    ref: str              # référence normalisée
+
+
+@dataclass(frozen=True)
+class Colonne:
+    """Un paquet CANDIDAT, précalculé avant que le solveur ne choisisse de
+    le retenir. `membres` contient des indices dans la liste d'écritures
+    fournie en entrée (pas des objets Ecriture, pour rester léger)."""
+    membres: tuple[int, ...]
+    taille: int
+    span_jours: int
+    prior_score: int       # somme pondérée des relations historiques honorées
+    prior_paires: int       # nombre de paires de relations honorées (pour l'audit)
+
+
+@dataclass
+class Paquet:
+    """Un paquet de lettrage RETENU par le solveur, avec ses éléments
+    d'explication pour l'audit (traçabilité d'une décision de lettrage)."""
+    membres: list[Ecriture]
+    span_jours: int
+    prior_score: int
+    prior_paires: int
+    solver_status: str
+    identifiant: str
+
+    @property
+    def somme(self) -> int:
+        """Doit valoir 0 (ou être dans [-tol, +tol]) — invariant comptable."""
+        return sum(e.amt_minor for e in self.membres)
+
+    @property
+    def cardinalite(self) -> int:
+        return len(self.membres)
+
+
+@dataclass
+class ConfigLettrage:
+    """Paramètres de résolution. Aucun paramètre de cardinalité de paquet :
+    la préférence pour les petits paquets est un objectif, pas une borne."""
+
+    # Tolérance d'équilibre du paquet, en centimes. 0 = lettrage exact.
+    tol_minor: int = 0
+
+    # Taille maximale d'une composante connexe du graphe des relations
+    # historiques que l'on accepte d'énumérer intégralement (2^taille
+    # sous-ensembles dans le pire cas). Au-delà, la composante est exclue
+    # et ses écritures renvoyées à part — voir `ecritures_exclues` dans le
+    # résultat de `enumerer_paquets_candidats`.
+    taille_max_composante: int = 20
+
+    # Garde-fou de volumétrie : si le nombre de paquets candidats dépasse
+    # ce seuil, on arrête avant de construire le modèle CP-SAT plutôt que
+    # de risquer un modèle trop lourd. À ce stade, c'est le signe qu'un
+    # découpage plus fin en amont (compte × devise × fenêtre datée) est
+    # nécessaire — ce n'est pas le rôle de ce module de le faire.
+    max_colonnes: int = 200_000
+
+    # Temps maximum par niveau de l'objectif lexicographique (secondes).
+    # Il y a 4 niveaux, donc jusqu'à environ 4× cette valeur au total.
+    temps_max_par_niveau_s: float = 5.0
+
+    # Nombre de threads du solveur. 8 par défaut : la recherche en
+    # portefeuille est nettement plus rapide que le mono-thread sur ce
+    # modèle. Pour une reproductibilité stricte octet pour octet, utiliser
+    # workers=1 (plus lent) — dans tous les cas la seed est fixe et chaque
+    # paquet produit reste audit able indépendamment du réglage.
+    workers: int = 8
+    seed: int = 42
+
+    # Si un niveau structurant de l'objectif (couverture, petits paquets)
+    # n'est pas prouvé optimal dans le temps imparti, on rejette le
+    # résultat plutôt que de garder un lettrage "faisable mais non prouvé"
+    # — qui serait inexploitable en comptabilité et non reproductible.
+    exiger_optimum: bool = True
+
+
+# =============================================================================
+# 2. Graphe des relations historiques (priors)
+# =============================================================================
+
+def construire_graphe_relations(
+    ecritures: list[Ecriture],
+    priors: dict[tuple[str, str], int],
+) -> tuple[dict[int, set[int]], dict[tuple[int, int], int]]:
+    """Construit, pour le bloc d'écritures fourni, le graphe des relations
+    historiques débit/crédit.
+
+    Une arête (i, j) existe si les références de i et j sont enregistrées
+    comme se lettrant habituellement ensemble ET si i et j sont de signe
+    opposé (une relation ne peut jamais relier deux débits entre eux).
+
+    Args:
+        ecritures: écritures du bloc, dans l'ordre où elles seront indexées.
+        priors: table historique {(ref_a, ref_b): poids}.
+
+    Returns:
+        relies: pour chaque indice i, l'ensemble des indices j reliés à i.
+        poids: pour chaque arête (i, j) avec i < j, son poids historique.
+    """
+    n = len(ecritures)
+    relies: dict[int, set[int]] = {i: set() for i in range(n)}
+    poids: dict[tuple[int, int], int] = {}
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            ref_a, ref_b = ecritures[i].ref, ecritures[j].ref
+            w = priors.get((ref_a, ref_b)) or priors.get((ref_b, ref_a))
+            signes_opposes = ecritures[i].amt_minor * ecritures[j].amt_minor < 0
+            if w and signes_opposes:
+                relies[i].add(j)
+                relies[j].add(i)
+                poids[(i, j)] = int(w)
+
+    return relies, poids
+
+
+def composantes_connexes(n: int, relies: dict[int, set[int]]) -> list[list[int]]:
+    """Découpe le graphe des relations en composantes connexes (BFS).
+
+    Une écriture sans aucune relation connue n'apparaît dans aucune
+    composante retournée ici — elle sera traitée séparément comme
+    candidate à une paire isolée (cf. `enumerer_paires_isolees`).
+
+    Args:
+        n: nombre total d'écritures du bloc.
+        relies: graphe des relations, tel que produit par
+            `construire_graphe_relations`.
+
+    Returns:
+        La liste des composantes, chacune étant la liste des indices
+        d'écritures qui la composent.
+    """
+    vus: set[int] = set()
+    composantes: list[list[int]] = []
+
+    for depart in range(n):
+        if depart in vus or not relies.get(depart):
+            continue
+        pile, composante = [depart], []
+        vus.add(depart)
+        while pile:
+            i = pile.pop()
+            composante.append(i)
+            for j in relies[i]:
+                if j not in vus:
+                    vus.add(j)
+                    pile.append(j)
+        composantes.append(composante)
+
+    return composantes
+
+
+# =============================================================================
+# 3. Énumération des paquets candidats
+# =============================================================================
+
+def enumerer_paires_isolees(
+    ecritures: list[Ecriture],
+    indices_isoles: list[int],
+    tol_minor: int,
+) -> list[Colonne]:
+    """Énumère les paires candidates entre écritures SANS relation connue.
+
+    Une écriture isolée ne peut être lettrée qu'en paire exacte avec une
+    autre écriture isolée de signe opposé, dans la tolérance. Recherche
+    par tri + dichotomie (O(m log m)) plutôt que par double boucle
+    (O(m²)) : à l'échelle d'un bloc de plusieurs dizaines de milliers
+    d'écritures isolées, la différence est déterminante.
+
+    Args:
+        ecritures: toutes les écritures du bloc (pour lire montant et date).
+        indices_isoles: indices des écritures sans aucune relation connue.
+        tol_minor: tolérance d'équilibre, en centimes.
+
+    Returns:
+        Une colonne candidate par paire trouvée.
+    """
+    debits = sorted(
+        (i for i in indices_isoles if ecritures[i].amt_minor > 0),
+        key=lambda i: ecritures[i].amt_minor,
+    )
+    credits = sorted(
+        (i for i in indices_isoles if ecritures[i].amt_minor < 0),
+        key=lambda i: ecritures[i].amt_minor,
+    )
+    montants_credits = [ecritures[i].amt_minor for i in credits]
+
+    colonnes: list[Colonne] = []
+    for i in debits:
+        montant_i = ecritures[i].amt_minor
+        # On cherche les crédits dont le montant est dans
+        # [-montant_i - tol, -montant_i + tol].
+        borne_basse = -montant_i - tol_minor
+        borne_haute = -montant_i + tol_minor
+        gauche = bisect.bisect_left(montants_credits, borne_basse)
+        droite = bisect.bisect_right(montants_credits, borne_haute)
+        for pos in range(gauche, droite):
+            j = credits[pos]
+            colonnes.append(Colonne(
+                membres=tuple(sorted((i, j))),
+                taille=2,
+                span_jours=abs(ecritures[i].txn_date - ecritures[j].txn_date),
+                prior_score=0,
+                prior_paires=0,
+            ))
+    return colonnes
+
+
+def enumerer_paquets_dune_composante(
+    ecritures: list[Ecriture],
+    composante: list[int],
+    relies: dict[int, set[int]],
+    poids: dict[tuple[int, int], int],
+    tol_minor: int,
+) -> list[Colonne]:
+    """Énumère tous les sous-ensembles réalisables d'UNE composante connexe.
+
+    Un sous-ensemble est réalisable si :
+      * il compte au moins 2 écritures ;
+      * chaque écriture retenue a au moins un "voisin de relation" (arête
+        du graphe des priors) également retenu dans le sous-ensemble —
+        c'est la cohérence débit/crédit métier ;
+      * sa somme signée est dans la tolérance.
+
+    La mixité débit/crédit en découle automatiquement : toute arête du
+    graphe relie un débit à un crédit (cf. `construire_graphe_relations`),
+    donc un sous-ensemble non vide qui respecte la condition de voisinage
+    contient forcément les deux.
+
+    Parcours par bitmask (2^taille sous-ensembles) : rapide tant que la
+    composante reste petite, ce qui est le cas normal en pratique (une
+    relation facture/règlement fait de 2 à quelques écritures). Les
+    composantes anormalement grandes doivent être filtrées par l'appelant
+    avant d'invoquer cette fonction (cf. `taille_max_composante`).
+
+    Args:
+        ecritures: toutes les écritures du bloc.
+        composante: indices d'écritures formant cette composante connexe.
+        relies: graphe des relations (pour vérifier la cohérence).
+        poids: poids historique de chaque arête (pour noter les candidats).
+        tol_minor: tolérance d'équilibre, en centimes.
+
+    Returns:
+        Une colonne candidate par sous-ensemble réalisable trouvé.
+    """
+    m = len(composante)
+    composante_set = set(composante)
+    voisins_dans_composante = {i: relies[i] & composante_set for i in composante}
+
+    colonnes: list[Colonne] = []
+    for masque in range(1, 1 << m):
+        if bin(masque).count("1") < 2:
+            continue
+        membres = tuple(composante[b] for b in range(m) if masque & (1 << b))
+        membres_set = set(membres)
+
+        # Cohérence : chaque membre a au moins un voisin de relation retenu.
+        if not all(voisins_dans_composante[i] & membres_set for i in membres):
+            continue
+
+        somme = sum(ecritures[i].amt_minor for i in membres)
+        if not (-tol_minor <= somme <= tol_minor):
+            continue
+
+        paires_honorees = [
+            (i, j) for (i, j) in poids if i in membres_set and j in membres_set
+        ]
+        dates = [ecritures[i].txn_date for i in membres]
+
+        colonnes.append(Colonne(
+            membres=tuple(sorted(membres)),
+            taille=len(membres),
+            span_jours=max(dates) - min(dates),
+            prior_score=sum(poids[p] for p in paires_honorees),
+            prior_paires=len(paires_honorees),
+        ))
+
+    return colonnes
+
+
+def enumerer_paquets_candidats(
+    ecritures: list[Ecriture],
+    priors: dict[tuple[str, str], int],
+    config: ConfigLettrage,
+) -> tuple[list[Colonne], list[int]]:
+    """Point d'entrée de l'énumération : produit tous les paquets candidats
+    d'un bloc, en combinant paires isolées et sous-ensembles de composantes.
+
+    Args:
+        ecritures: écritures du bloc à lettrer.
+        priors: table historique des relations débit/crédit par référence.
+        config: paramètres de résolution.
+
+    Returns:
+        colonnes: tous les paquets candidats trouvés.
+        indices_exclus: indices d'écritures appartenant à une composante
+            trop grande pour être énumérée (cf. `taille_max_composante`) —
+            à traiter séparément (escalade, re-découpage).
+    """
+    n = len(ecritures)
+    relies, poids = construire_graphe_relations(ecritures, priors)
+
+    colonnes: list[Colonne] = []
+    indices_exclus: list[int] = []
+
+    indices_isoles = [i for i in range(n) if not relies[i]]
+    colonnes += enumerer_paires_isolees(ecritures, indices_isoles, config.tol_minor)
+
+    for composante in composantes_connexes(n, relies):
+        if len(composante) > config.taille_max_composante:
+            indices_exclus.extend(composante)
+            continue
+        colonnes += enumerer_paquets_dune_composante(
+            ecritures, composante, relies, poids, config.tol_minor,
+        )
+
+    return colonnes, indices_exclus
+
+
+# =============================================================================
+# 4. Résolution — choix des colonnes à retenir (set packing)
+# =============================================================================
+
+def resoudre_lettrage(
+    ecritures: list[Ecriture],
+    priors: dict[tuple[str, str], int],
+    config: ConfigLettrage,
+    identifiant: str = "bloc",
+) -> tuple[list[Paquet], bool, list[Ecriture]]:
+    """Lettre un bloc d'écritures : énumère les paquets candidats puis
+    demande à CP-SAT lesquels retenir, sous contrainte qu'une écriture
+    n'appartienne qu'à un seul paquet retenu (au plus).
+
+    L'objectif est résolu en 4 niveaux lexicographiques successifs — le
+    niveau (n+1) n'est optimisé qu'après avoir figé la valeur optimale du
+    niveau n — dans l'ordre des préférences métier : couverture, puis
+    petits paquets, puis cohérence historique, puis étendue de dates.
+
+    Args:
+        ecritures: écritures du bloc à lettrer (compte × devise déjà
+            homogènes ; c'est la responsabilité de l'appelant).
+        priors: table historique des relations débit/crédit par référence.
+        config: paramètres de résolution.
+        identifiant: étiquette libre du bloc, reportée sur chaque paquet
+            produit pour la traçabilité (ex. "411000-EUR/2026-01").
+
+    Returns:
+        paquets: les paquets de lettrage retenus.
+        optimum_structurant_prouve: True si les niveaux 1 et 2 de
+            l'objectif (couverture, petits paquets) ont été prouvés
+            optimaux — s'ils ne le sont pas, le résultat ne doit pas être
+            auto-validé, voir `ConfigLettrage.exiger_optimum`.
+        ecritures_non_traitees: écritures exclues de l'énumération
+            (composante trop grande) ou laissées ouvertes par le solveur
+            (aucun paquet équilibré trouvé les concernant).
+    """
+    colonnes, indices_exclus = enumerer_paquets_candidats(ecritures, priors, config)
+    ecritures_exclues = [ecritures[i] for i in indices_exclus]
+
+    if not colonnes:
+        return [], True, ecritures_exclues
+
+    if len(colonnes) > config.max_colonnes:
+        # Volumétrie anormale pour un bloc censé être déjà découpé en amont
+        # (compte × devise × cluster de priors × fenêtre datée). On ne
+        # tente pas de résoudre : mieux vaut le signaler que de risquer un
+        # modèle trop lourd pour CP-SAT.
+        return [], False, list(ecritures)
+
+    modele = cp_model.CpModel()
+    x = [modele.NewBoolVar(f"x_{g}") for g in range(len(colonnes))]
+
+    # Une écriture appartient à au plus un paquet retenu (résiduel autorisé).
+    colonnes_par_ecriture: dict[int, list[int]] = {}
+    for g, colonne in enumerate(colonnes):
+        for i in colonne.membres:
+            colonnes_par_ecriture.setdefault(i, []).append(g)
+    for indices_colonnes in colonnes_par_ecriture.values():
+        modele.AddAtMostOne(x[g] for g in indices_colonnes)
+
+    couverture = sum(colonnes[g].taille * x[g] for g in range(len(colonnes)))
+    nb_paquets_retenus = sum(x)
+    score_priors = sum(
+        colonnes[g].prior_score * x[g]
+        for g in range(len(colonnes)) if colonnes[g].prior_score
+    )
+    etendue_totale = sum(colonnes[g].span_jours * x[g] for g in range(len(colonnes)))
+
+    niveaux_objectif = [
+        # 1. Lettrer le plus d'écritures possible.
+        ("couverture", couverture, "max"),
+        # 2. À couverture égale, retenir le plus de paquets possible —
+        #    ce qui revient à préférer les petits paquets, sans qu'aucune
+        #    taille maximale n'ait été fixée à l'avance.
+        ("petits_paquets", nb_paquets_retenus, "max"),
+        # 3. Respecter au mieux les relations débit/crédit historiques.
+        ("priors", score_priors, "max"),
+        # 4. Resserrer les paquets dans le temps.
+        ("span", etendue_totale, "min"),
+    ]
+
+    solveur = cp_model.CpSolver()
+    solveur.parameters.num_workers = config.workers
+    solveur.parameters.random_seed = config.seed
+    solveur.parameters.max_time_in_seconds = config.temps_max_par_niveau_s
+
+    statut_final = "UNKNOWN"
+    optimum_structurant_prouve = True
+
+    for nom_niveau, expression, sens in niveaux_objectif:
+        if isinstance(expression, int):        # niveau vide (ex. aucun prior)
+            continue
+
+        (modele.Maximize if sens == "max" else modele.Minimize)(expression)
+        statut = solveur.Solve(modele)
+
+        if statut not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            break
+        statut_final = solveur.StatusName(statut)
+
+        # Les niveaux 1 et 2 décident de la STRUCTURE du lettrage (qui va
+        # avec qui). S'ils ne sont pas prouvés optimaux, le résultat n'est
+        # pas fiable pour un auto-lettrage comptable.
+        if nom_niveau in ("couverture", "petits_paquets") and statut != cp_model.OPTIMAL:
+            optimum_structurant_prouve = False
+            if config.exiger_optimum:
+                return [], False, list(ecritures)
+
+        valeur_figee = int(solveur.ObjectiveValue())
+        modele.ClearObjective()
+        if sens == "max":
+            modele.Add(expression >= valeur_figee)
+        else:
+            modele.Add(expression <= valeur_figee)
+
+        modele.ClearHints()
+        for g in range(len(colonnes)):
+            modele.AddHint(x[g], solveur.Value(x[g]))
+
+    if statut_final == "UNKNOWN":
+        return [], False, list(ecritures)
+
+    indices_lettres: set[int] = set()
+    paquets: list[Paquet] = []
+    for g, colonne in enumerate(colonnes):
+        if not solveur.Value(x[g]):
+            continue
+        indices_lettres.update(colonne.membres)
+        paquets.append(Paquet(
+            membres=[ecritures[i] for i in colonne.membres],
+            span_jours=colonne.span_jours,
+            prior_score=colonne.prior_score,
+            prior_paires=colonne.prior_paires,
+            solver_status=statut_final,
+            identifiant=identifiant,
+        ))
+
+    non_lettrees = [
+        e for i, e in enumerate(ecritures) if i not in indices_lettres
+    ]
+    return paquets, optimum_structurant_prouve, ecritures_exclues + non_lettrees
+
+
+# =============================================================================
+# 5. Exemple / test de non-régression
+# =============================================================================
+
+if __name__ == "__main__":
+    import random
+    random.seed(1)
+
+    ecritures: list[Ecriture] = []
+    priors: dict[tuple[str, str], int] = {}
+    _compteur = [0]
+
+    def ajouter(montant: int, date: int, ref: str) -> None:
+        _compteur[0] += 1
+        ecritures.append(Ecriture(f"T{_compteur[0]:05d}", montant, date, ref))
+
+    # Cas 1 : 60 factures payées exactement (paires 1:1), refs liées par prior.
+    for i in range(60):
+        d = random.randint(0, 120)
+        montant = random.randint(1000, 500_000)
+        ajouter(montant, d, f"FAC{i}")
+        ajouter(-montant, d + random.randint(0, 20), f"REG{i}")
+        priors[(f"FAC{i}", f"REG{i}")] = 10
+
+    # Cas 2 : 15 règlements groupés couvrant 2 ou 3 factures (1:N).
+    for i in range(15):
+        d = random.randint(0, 120)
+        parts = [random.randint(1000, 200_000) for _ in range(random.choice([2, 3]))]
+        for j, montant in enumerate(parts):
+            ajouter(montant, d + j, f"FACG{i}_{j}")
+            priors[(f"FACG{i}_{j}", f"REGG{i}")] = 8
+        ajouter(-sum(parts), d + 10, f"REGG{i}")
+
+    # Cas 3 : 20 écritures orphelines (ne doivent PAS être lettrées).
+    for i in range(20):
+        ajouter(
+            random.choice([-1, 1]) * random.randint(1000, 300_000),
+            random.randint(0, 120),
+            f"ORPH{i}",
+        )
+
+    config = ConfigLettrage(temps_max_par_niveau_s=8.0)
+    paquets, optimum_prouve, non_traitees = resoudre_lettrage(
+        ecritures, priors, config, identifiant="411000-EUR",
+    )
+
+    print(f"écritures : {len(ecritures)} | paquets : {len(paquets)} | "
+          f"non traitées : {len(non_traitees)} | optimum prouvé : {optimum_prouve}")
+
+    tailles: dict[int, int] = {}
+    for p in paquets:
+        assert p.somme == 0, "paquet déséquilibré !"
+        tailles[p.cardinalite] = tailles.get(p.cardinalite, 0) + 1
+    print("répartition par cardinalité :", dict(sorted(tailles.items())))
+
+    couverts = sum(p.cardinalite for p in paquets)
+    print(f"couverture : {couverts}/{len(ecritures)} écritures")
+    print("étendue moyenne :", round(sum(p.span_jours for p in paquets) / len(paquets), 1), "jours")
+    print("paires de relations honorées :", sum(p.prior_paires for p in paquets))
+
+    orphelins_lettres = sum(1 for p in paquets for e in p.membres if e.ref.startswith("ORPH"))
+    assert orphelins_lettres == 0, "des orphelins ont été lettrés à tort !"
+    print("orphelins lettrés à tort : 0 (attendu)")
+
+    exemple = paquets[0]
+    print("exemple :", [(e.txn_id, e.amt_minor, e.ref) for e in exemple.membres],
+          "| span", exemple.span_jours, "j | statut", exemple.solver_status)
