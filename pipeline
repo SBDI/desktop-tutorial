@@ -1,0 +1,1673 @@
+# =============================================================================
+# lettrage_pipeline.py — pipeline de lettrage distribué (CP-SAT + Spark)
+#
+# Version anonymisée : aucun nom de table, de colonne métier, de code client
+# ou de règle spécifique n'est écrit en dur. Tout passe par PipelineConfig,
+# dont les valeurs par défaut sont génériques.
+#
+# Les vraies valeurs (tables, mapping de colonnes, codes métier) doivent vivre
+# dans un fichier de configuration privé, hors du dépôt partagé, par exemple :
+#
+#     # config_local.py  (dans .gitignore)
+#     from lettrage_pipeline import PipelineConfig
+#     CFG = PipelineConfig(input_table="...", amount_col="...", ...)
+#
+# Les règles métier optionnelles sont désactivées tant qu'elles ne sont pas
+# configurées (listes vides / None) : le pipeline tourne sur n'importe quel
+# jeu de données synthétique ayant les colonnes minimales.
+# =============================================================================
+
+import logging
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Tuple
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration unique du pipeline distribue."""
+
+    # --- I/O (placeholders : a surcharger dans la config privee) ---
+    input_table: str = "catalog.schema.input_table"
+    output_table: str = "catalog.schema.lettrage_detail"
+    output_stats_table: str = "catalog.schema.lettrage_stats"
+    output_coherence_table: str = "catalog.schema.lettrage_coherence"
+    runs_history_table: str = "catalog.schema.lettrage_runs_history"
+    relation_table: str = "catalog.schema.relation_table"
+
+    # --- Cles de regroupement (un groupe = une combinaison de ces colonnes) ---
+    account_keys: List[str] = field(
+        default_factory=lambda: ["contract_ref", "company_code", "business_area", "currency", "matching_key"]
+    )
+
+    # --- Mapping des colonnes de la table source ---
+    idx_col: str = "_idx"                         # colonne technique creee si absente
+    amount_col: str = "amount"                    # montant signe : debit > 0, credit < 0
+    acte_col: str = "act_code"                    # code d'acte / operation
+    typo_col: str = "typology_label"              # typologie du poste
+    clearing_status_col: str = "clearing_status"  # statut de compensation
+    posting_date_col: str = "posting_date"        # date comptable
+    contract_ref_col: str = "contract_ref"        # reference contrat (filtre par prefixe)
+    matching_key_col: str = "matching_key"        # cle de lettrage existante (nettoyee par trim)
+    doc_type_col: str = "doc_type"                # type de piece
+    partner_col: str = "partner_id"               # partenaire
+    external_ref_col: str = "external_ref"        # reference externe
+    main_txn_col: str = "main_txn"                # operation principale
+    account_type_col: str = "account_type"        # type de compte (perimetre regle R3)
+    category_type_col: str = "category_type"      # categorie (perimetre regle R3)
+
+    # --- Mapping des colonnes de la table de relations ---
+    rel_act1_col: str = "act_1"
+    rel_act2_col: str = "act_2"
+    rel_default_col: str = "is_default"           # 1 = relation par defaut, 0 = secondaire
+
+    # --- Normalisation des codes d'acte ---
+    # Regex retiree en tete du code avant comparaison (ex. r"^XX\s+"). None = aucune.
+    acte_prefix_pattern: Optional[str] = None
+
+    # --- Nettoyage / perimetre (desactives si vides) ---
+    typologies_exclues: List[str] = field(default_factory=list)
+    excluded_clearing_status: Optional[str] = None             # postes avec ce statut exclus
+    excluded_ref_prefixes: List[str] = field(default_factory=list)  # prefixes de contract_ref exclus
+
+    # --- Pre-filtre relation d'actes ---
+    filtre_relation_actes: bool = True
+
+    # --- Filtre derniere periode (date comptable) ---
+    exclure_dernier_mois: bool = False
+    dernier_mois_debut: Optional[str] = None  # debut (inclus), format YYYY-MM-DD
+    dernier_mois_fin: Optional[str] = None    # fin (incluse), format YYYY-MM-DD
+
+    # --- Regles de coherence (post-processing) ---
+    max_ecart_jours: int = 90  # R3 : ecart max entre postes d'un groupe, pour le perimetre r3_scope
+    # R3 : perimetre = liste de (valeurs de account_type, valeur de category_type). Vide = R3 desactivee.
+    r3_scope: List[Tuple[Tuple[str, ...], str]] = field(default_factory=list)
+    # R1 : groupe contenant un de ces types de piece ET ecart > r1_max_days. Vide = R1 desactivee.
+    r1_doc_types: List[str] = field(default_factory=list)
+    r1_max_days: int = 365
+    # R2 : groupe entierement compose de ces types de piece ET >1 reference externe. Vide = R2 desactivee.
+    r2_doc_types: List[str] = field(default_factory=list)
+
+    # --- Solveur CP-SAT ---
+    tolerance: float = 0.0
+    scale: int = 100
+    objective: str = "max_count"  # max_count | max_volume | lexicographic
+    lexico_delta: int = 5
+    num_workers_cpsat: int = 1
+    max_iter_per_group: int = 1
+    min_group_size_cpsat: int = 2
+    max_model_size: int = 20000  # groupes plus grands -> NON_TRAITE
+
+    # --- Hints relation d'actes (guide le solveur) ---
+    use_relation_hint: bool = False
+    max_hint_positions: int = 10
+
+    # --- Debug solveur ---
+    log_search_progress: bool = False
+
+    # --- Timeout adaptatif (secondes) par taille de groupe ---
+    timeout_min: int = 5     # pour les groupes de 2 postes
+    timeout_max: int = 120   # pour les groupes de max_model_size postes
+    timeout_tol_factor: float = 1.0  # effective_max = timeout_max * (1 + tolerance * factor)
+
+    # --- Filtre comptes cibles (test rapide) ---
+    # Deux formats supportes :
+    #   - dict : {"<colonne>": ["<valeur>", ...]} filtre chaque cle independamment (AND)
+    #   - list de tuples alignes sur account_keys : [("v1", "v2", ...), ...]
+    #   - None ou vide -> pas de filtre
+    filter_accounts: Optional[Any] = None
+    test_limit: Optional[int] = None
+
+    # --- Execution ---
+    n_partitions_hint: int = 2000
+    save_results: bool = True
+    run_label: Optional[str] = None
+
+    # =========================================================================
+    # Evolutions P1-P6. Chaque option vaut le comportement actuel par defaut :
+    # un run sans les activer produit exactement les memes lettrages qu'avant.
+    # P0 (observabilite) est toujours actif : il ajoute des colonnes, sans
+    # changer aucun lettrage.
+    # =========================================================================
+
+    # P3 : moteur de resolution d'un groupe
+    #   "legacy"         : un sous-ensemble equilibre, le plus grand possible (actuel)
+    #   "smallest_first" : plus petit paquet d'abord, itere, par fenetres de dates
+    moteur: str = "legacy"
+
+    # P1 : un resultat sans preuve d'optimalite part en revue (A_REVOIR)
+    router_non_prouves: bool = False
+
+    # P2 : passe exacte 1:1 avant le solveur
+    passe_exacte: bool = False
+
+    # P3 : fenetres de dates escaladantes, en jours. None = tout le residuel du groupe.
+    fenetres_jours: List[Optional[int]] = field(default_factory=lambda: [30, 90, None])
+    # Limite dure d'etendue d'un paquet (toutes passes). None = pas de limite globale.
+    # La limite R3 (max_ecart_jours, perimetre r3_scope) s'y ajoute pour les groupes concernes.
+    ecart_max_jours: Optional[int] = None
+
+    # P4/P5 : politique de coherence (moteur smallest_first)
+    #   "aucune"        : aucune contrainte (equivalent du comportement actuel)
+    #   "relation"      : une ecriture reliee n'entre qu'avec une ecriture en relation ;
+    #                     les ecritures sans relation ne forment que des paires
+    #   "mixte"         : relations la ou elles existent ; les ecritures sans relation
+    #                     forment des paquets 1:N / N:1 bornes
+    #   "sans_relation" : paquets 1:N / N:1 bornes, relations ignorees
+    politique_coherence: str = "aucune"
+    k_max_sans_relation: int = 4   # taille max d'un paquet forme sans relation
+
+    # P5 : un paquet sans relation et ambigu (alternative possible) part en revue
+    router_ambigus: bool = False
+
+    # P6 : a taille egale, preferer le paquet le plus resserre dans le temps
+    departage_etendue: bool = False
+
+    # Garde-fous du moteur smallest_first
+    temps_par_resolution_s: float = 2.0     # limite d'une resolution CP-SAT
+    budget_groupe_s: Optional[float] = None  # None = 4 x le timeout adaptatif du groupe
+    max_paquets_par_groupe: int = 5000
+    max_entrees_par_modele: int = 3000       # au-dela, la fenetre est laissee au residuel
+
+    @classmethod
+    def profil_cible(cls, **overrides):
+        """Configuration recommandee par le document de reference (P1-P6 actives).
+        Les valeurs metier (fenetres, tolerances, limites) restent a confirmer."""
+        base = dict(
+            moteur="smallest_first",
+            router_non_prouves=True,
+            passe_exacte=True,
+            politique_coherence="mixte",
+            router_ambigus=True,
+            departage_etendue=True,
+            filtre_relation_actes=False,   # remplace par la politique de coherence
+            # Sans relation, seulement des paires : sur 10 000 ecritures dont 800 de
+            # bruit, k=4 a produit 4 faux paquets "univoques" et coute 10x plus de
+            # temps ; k=2 n'en produit aucun. Les 1:N sans relation restent possibles
+            # sur choix explicite (k_max_sans_relation=3 ou 4).
+            k_max_sans_relation=2,
+        )
+        base.update(overrides)
+        return cls(**base)
+
+
+MOTEURS = ("legacy", "smallest_first")
+POLITIQUES = ("aucune", "relation", "mixte", "sans_relation")
+
+
+def _valider_config(cfg: PipelineConfig) -> None:
+    """Echoue tot, sur le driver, plutot que dans un executeur."""
+    if cfg.moteur not in MOTEURS:
+        raise ValueError(f"moteur inconnu: {cfg.moteur!r} (attendu: {MOTEURS})")
+    if cfg.politique_coherence not in POLITIQUES:
+        raise ValueError(f"politique_coherence inconnue: {cfg.politique_coherence!r} (attendu: {POLITIQUES})")
+    if cfg.moteur == "legacy" and cfg.politique_coherence != "aucune":
+        raise ValueError("politique_coherence ne s'applique qu'au moteur smallest_first")
+    if not cfg.fenetres_jours:
+        raise ValueError("fenetres_jours ne peut pas etre vide (utiliser [None] pour tout le groupe)")
+    if any(w is not None and w <= 0 for w in cfg.fenetres_jours):
+        raise ValueError("fenetres_jours : durees strictement positives ou None")
+    if cfg.k_max_sans_relation < 2:
+        raise ValueError("k_max_sans_relation doit etre >= 2")
+
+
+def _relations_requises(cfg: PipelineConfig) -> bool:
+    """La table de relations doit-elle etre diffusee aux executeurs ?"""
+    return (cfg.use_relation_hint or cfg.passe_exacte
+            or (cfg.moteur == "smallest_first" and cfg.politique_coherence in ("relation", "mixte")))
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("pipeline_lettrage")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(h)
+    logger.propagate = False
+    return logger
+
+log = _setup_logging()
+
+
+# =============================================================================
+# NORMALISATION ACTE (expression Spark reutilisable)
+# =============================================================================
+
+def _norm_acte_expr(col, prefix_pattern: Optional[str] = None):
+    """Expression Spark : lower(trim(regexp_replace(trim(cast(col,'string')), prefix_pattern, '')))"""
+    from pyspark.sql import functions as F
+    s = F.trim(col.cast("string"))
+    if prefix_pattern:
+        s = F.regexp_replace(s, prefix_pattern, "")
+    return F.coalesce(F.lower(F.trim(s)), F.lit(""))
+
+
+# =============================================================================
+# CHARGEMENT ET NETTOYAGE (appele une seule fois)
+# =============================================================================
+
+def charger_et_nettoyer(spark, cfg: PipelineConfig):
+    """
+    Charge la table source, applique tous les nettoyages, ajoute les colonnes
+    techniques (_idx, _acte_norm, _posting_ts), cache et materialise.
+
+    Retourne (df, nb_total).
+    """
+    from pyspark.sql import functions as F
+
+    log.info(f"Chargement: {cfg.input_table}")
+    sdf = spark.table(cfg.input_table)
+
+    # Nettoyage MONTANT
+    if cfg.amount_col in sdf.columns:
+        sdf = sdf.withColumn(cfg.amount_col,
+            F.coalesce(
+                F.regexp_replace(F.regexp_replace(F.col(cfg.amount_col).cast("string"), ",", "."), " ", "")
+                .cast("double"),
+                F.lit(0.0)
+            )
+        )
+
+    # Nettoyage cle de lettrage existante
+    if cfg.matching_key_col in sdf.columns:
+        sdf = sdf.withColumn(cfg.matching_key_col,
+            F.coalesce(F.trim(F.col(cfg.matching_key_col).cast("string")), F.lit("")))
+
+    # Exclusion statut de compensation
+    if cfg.excluded_clearing_status is not None and cfg.clearing_status_col in sdf.columns:
+        n0 = sdf.count()
+        sdf = sdf.filter(~((F.col(cfg.clearing_status_col).isNotNull())
+                           & (F.col(cfg.clearing_status_col) == cfg.excluded_clearing_status)))
+        n1 = sdf.count()
+        if n0 - n1 > 0:
+            log.info(f"  Statut de compensation exclu: {n0-n1:,} postes exclus")
+
+    # Exclusion typologies
+    if cfg.typo_col in sdf.columns and cfg.typologies_exclues:
+        n0 = sdf.count()
+        sdf = sdf.filter(~F.col(cfg.typo_col).isin(cfg.typologies_exclues))
+        n1 = sdf.count()
+        if n0 - n1 > 0:
+            log.info(f"  Typologies: {n0-n1:,} postes exclus")
+
+    # Perimetre : exclure des prefixes de reference contrat
+    if cfg.excluded_ref_prefixes and cfg.contract_ref_col in sdf.columns:
+        n0 = sdf.count()
+        cond = F.lit(True)
+        for p in cfg.excluded_ref_prefixes:
+            cond = cond & (~F.col(cfg.contract_ref_col).startswith(p))
+        sdf = sdf.filter(cond)
+        n1 = sdf.count()
+        if n0 - n1 > 0:
+            log.info(f"  Prefixes de reference exclus: {n0-n1:,} postes exclus")
+
+    # Filtre derniere periode (date comptable)
+    if (cfg.exclure_dernier_mois and cfg.posting_date_col in sdf.columns
+            and cfg.dernier_mois_debut and cfg.dernier_mois_fin):
+        n0 = sdf.count()
+        d = F.to_date(F.col(cfg.posting_date_col))
+        sdf = sdf.filter(
+            ~((d >= F.lit(cfg.dernier_mois_debut)) & (d <= F.lit(cfg.dernier_mois_fin)))
+        )
+        n1 = sdf.count()
+        if n0 - n1 > 0:
+            log.info(f"  Derniere periode ({cfg.dernier_mois_debut} -> {cfg.dernier_mois_fin}): {n0-n1:,} postes exclus")
+
+    # _idx
+    if cfg.idx_col not in sdf.columns:
+        sdf = sdf.withColumn(cfg.idx_col, F.monotonically_increasing_id())
+
+    # _posting_ts
+    if cfg.posting_date_col in sdf.columns and "_posting_ts" not in sdf.columns:
+        sdf = sdf.withColumn("_posting_ts",
+            F.coalesce(F.unix_timestamp(F.to_timestamp(F.col(cfg.posting_date_col))), F.lit(0)).cast("long"))
+
+    # _jour : date comptable en jours entiers (fenetres de dates, departage, passe exacte)
+    if "_jour" not in sdf.columns:
+        if cfg.posting_date_col in sdf.columns:
+            sdf = sdf.withColumn("_jour", F.coalesce(
+                F.datediff(F.to_date(F.col(cfg.posting_date_col)), F.lit("1970-01-01")), F.lit(0)).cast("long"))
+        else:
+            sdf = sdf.withColumn("_jour", F.lit(0).cast("long"))
+
+    # _acte_norm
+    if "_acte_norm" not in sdf.columns:
+        if cfg.acte_col in sdf.columns:
+            sdf = sdf.withColumn("_acte_norm", _norm_acte_expr(F.col(cfg.acte_col), cfg.acte_prefix_pattern))
+        else:
+            sdf = sdf.withColumn("_acte_norm", F.lit(""))
+
+    sdf = sdf.cache()
+    nb = sdf.count()
+    log.info(f"  {nb:,} postes charges (apres nettoyage)")
+    return sdf, nb
+
+
+# =============================================================================
+# CLASSIFICATION DES GROUPES (taille + timeout adaptatif)
+# =============================================================================
+
+def classifier_groupes(df, cfg: PipelineConfig):
+    """
+    Ajoute a chaque poste :
+      _grp_size   : taille du groupe (Window)
+      _timeout_s  : timeout adaptatif interpole lineairement
+
+    Pas de filtrage ici : TOUS les postes passent, la UDF decide.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+
+    w = Window.partitionBy(cfg.account_keys)
+    df = df.withColumn("_grp_size", F.count("*").over(w))
+
+    # Timeout adaptatif : lineaire entre (2, timeout_min) et (max_model_size, timeout_max)
+    # Scaling proportionnel a la tolerance (espace de recherche plus large -> plus de temps)
+    effective_timeout_max = int(cfg.timeout_max * max(1.0, 1.0 + cfg.tolerance * cfg.timeout_tol_factor))
+    log.info(f"  Timeout adaptatif: min={cfg.timeout_min}s, max={effective_timeout_max}s "
+             f"(base={cfg.timeout_max}s, tol={cfg.tolerance}, factor={cfg.timeout_tol_factor})")
+
+    slope = (effective_timeout_max - cfg.timeout_min) / max(cfg.max_model_size - 2, 1)
+    df = df.withColumn("_timeout_s",
+        F.least(
+            F.lit(effective_timeout_max),
+            F.greatest(
+                F.lit(cfg.timeout_min),
+                (F.lit(cfg.timeout_min) + (F.col("_grp_size") - 2) * F.lit(slope)).cast("int")
+            )
+        )
+    )
+
+    return df
+
+
+# =============================================================================
+# CONSTRUCTION DU MAPPING RELATIONS (broadcast pour hints)
+# =============================================================================
+
+def _build_relation_broadcast(spark, cfg: PipelineConfig):
+    """
+    Charge la table de relations, normalise les actes, et construit un dict
+    {account_key_tuple: [(acte1_norm, acte2_norm), ...]} broadcast aux executors.
+
+    Retourne le broadcast variable (ou None si desactive/inaccessible).
+    """
+    import re
+    import pandas as pd
+
+    if not _relations_requises(cfg):
+        return None
+
+    try:
+        df_rel = spark.table(cfg.relation_table).toPandas()
+    except Exception as e:
+        log.warning(f"Hint relations: table inaccessible ({e}) - hints desactives")
+        return None
+
+    pattern = cfg.acte_prefix_pattern
+
+    def _norm(s):
+        if pd.isna(s):
+            return ""
+        s = str(s).strip()
+        if pattern:
+            s = re.sub(pattern, "", s)
+        return s.strip().lower()
+
+    df_rel["_a1"] = df_rel[cfg.rel_act1_col].apply(_norm)
+    df_rel["_a2"] = df_rel[cfg.rel_act2_col].apply(_norm)
+
+    # Construire le lookup par account_keys
+    # On utilise les cles presentes dans la table de relations
+    avail_keys = [k for k in cfg.account_keys if k in df_rel.columns]
+    for k in avail_keys:
+        df_rel[k] = df_rel[k].fillna("").astype(str).str.strip()
+
+    rel_lookup = {}
+    for _, row in df_rel.iterrows():
+        key = tuple(str(row.get(k, "")).strip() for k in avail_keys)
+        rel_lookup.setdefault(key, []).append((row["_a1"], row["_a2"]))
+
+    # Deduplicate pairs per key
+    for key in rel_lookup:
+        rel_lookup[key] = list(set(rel_lookup[key]))
+
+    log.info(f"  Hints relations: {len(df_rel):,} paires | {len(rel_lookup):,} comptes")
+    log.info(f"  Cles de jointure hints: {avail_keys}")
+
+    bc_rel = spark.sparkContext.broadcast({"lookup": rel_lookup, "keys": avail_keys})
+    return bc_rel
+
+
+# =============================================================================
+# MOTEUR DE RESOLUTION (P2-P6)
+# =============================================================================
+#
+# Les fonctions du moteur sont definies DANS _make_engine() : elles sont ainsi
+# serialisees par valeur avec la UDF et n'exigent pas que ce module soit
+# importable sur les executeurs Spark (meme propriete que la UDF historique).
+# Elles ne dependent ni de Spark ni de pandas : elles sont testables seules.
+
+def _make_engine():
+    """Retourne un dict de fonctions pures : passe exacte, plus petit paquet
+    d'abord par fenetres de dates, coherence par relations, ambiguite."""
+
+    def partenaires_depuis_paires(paires):
+        """{acte: {actes en relation}} a partir d'une liste de paires (a1, a2)."""
+        partners = {}
+        for a1, a2 in paires or ():
+            if a1 and a2:
+                partners.setdefault(a1, set()).add(a2)
+                partners.setdefault(a2, set()).add(a1)
+        return partners
+
+    def a_une_relation(amt, actes, partners):
+        """Pour chaque ecriture : existe-t-il dans le groupe une ecriture de signe
+        oppose dont l'acte est en relation avec le sien ? O(n x nb partenaires)."""
+        from collections import Counter
+        pos, neg = Counter(), Counter()
+        for i, a in enumerate(actes):
+            if amt[i] > 0:
+                pos[a] += 1
+            elif amt[i] < 0:
+                neg[a] += 1
+        out = []
+        for i, a in enumerate(actes):
+            ps = partners.get(a) if a else None
+            if not ps:
+                out.append(False)
+                continue
+            autre = neg if amt[i] > 0 else pos
+            out.append(any(autre[b] > 0 for b in ps))
+        return out
+
+    def relies_dans(i, amt, actes, partners, par_acte):
+        """Ecritures de l'ensemble courant (indexe par acte) en relation avec i."""
+        ps = partners.get(actes[i])
+        if not ps:
+            return []
+        out = []
+        for b in ps:
+            for j in par_acte.get(b, ()):
+                if j != i and (amt[i] > 0) != (amt[j] > 0):
+                    out.append(j)
+        return out
+
+    def passe_exacte(positions, amt, days, actes, partners, has_rel, coherence, span_cap):
+        """Paires 1:1 de montants exactement opposes.
+        Priorite : partenaire en relation, puis date la plus proche, puis position.
+        Avec coherence : une ecriture ayant des relations n'est appariee qu'avec
+        une ecriture en relation ; deux ecritures sans relation peuvent s'apparier.
+        Retourne [(i, j, base, ambigu)]."""
+        from collections import Counter
+        positions = list(positions)
+        credits, debits = {}, {}
+        for j in positions:
+            if amt[j] < 0:
+                credits.setdefault(-amt[j], []).append(j)
+            elif amt[j] > 0:
+                debits.setdefault(amt[j], []).append(j)
+        nb_debits = Counter(amt[i] for i in positions if amt[i] > 0)
+
+        def dans_cap(i, j):
+            return span_cap is None or abs(days[j] - days[i]) <= span_cap
+
+        def relie(i, j):
+            return bool(actes[i]) and actes[j] in partners.get(actes[i], ())
+
+        import bisect
+        jours_tries = {}
+
+        def nb_dans(liste_key, sens, centre, d):
+            """Nombre d'ecritures de meme montant a distance <= d de centre (bisect)."""
+            cle = (liste_key, sens)
+            if cle not in jours_tries:
+                src = credits if sens < 0 else debits
+                jours_tries[cle] = sorted(days[k] for k in src.get(liste_key, ()))
+            js = jours_tries[cle]
+            return bisect.bisect_right(js, centre + d) - bisect.bisect_left(js, centre - d)
+
+        def partenaire_identifiable(i, j):
+            """Paire reliee univoque : aucun autre credit relie n'est aussi proche
+            de i, et aucun autre debit relie n'est aussi proche de j. Sinon le
+            montant et la date ne suffisent pas a dire qui regle quoi."""
+            d = abs(days[j] - days[i])
+            if len(credits.get(amt[i], ())) + len(debits.get(amt[i], ())) > 400:
+                # montant tres repete : test prudent (tout concurrent compte, relie ou non)
+                return nb_dans(amt[i], -1, days[i], d) <= 1 and nb_dans(amt[i], 1, days[j], d) <= 1
+            for k in credits.get(amt[i], ()):
+                if k != j and relie(i, k) and dans_cap(i, k) and abs(days[k] - days[i]) <= d:
+                    return False
+            for k in debits.get(amt[i], ()):
+                if k != i and relie(k, j) and dans_cap(k, j) and abs(days[j] - days[k]) <= d:
+                    return False
+            return True
+
+        used, out = set(), []
+        for i in sorted((i for i in positions if amt[i] > 0), key=lambda i: (days[i], i)):
+            cands = [j for j in credits.get(amt[i], ()) if j not in used and dans_cap(i, j)]
+            if not cands:
+                continue
+            relies = [j for j in cands if relie(i, j)]
+            if relies:
+                pool, base = relies, "RELATION"
+            else:
+                if coherence and has_rel[i]:
+                    continue
+                pool = [j for j in cands if not (coherence and has_rel[j])]
+                base = "MONTANT_EXACT"
+            if not pool:
+                continue
+            j = min(pool, key=lambda j: (abs(days[j] - days[i]), j))
+            if base == "RELATION":
+                ambigu = not partenaire_identifiable(i, j)
+            else:
+                ambigu = len(pool) > 1 or nb_debits[amt[i]] > 1
+            used.update((i, j))
+            out.append((i, j, base, ambigu))
+        return out
+
+    def construire_modele(S, amt, days, actes, partners, has_rel, politique, k_max,
+                          span_cap, tol, avec_dates, impose_isole=False):
+        """Modele CP-SAT d'UN paquet parmi les ecritures S (positions)."""
+        from ortools.sat.python import cp_model as cp
+        m = cp.CpModel()
+        x = {i: m.NewBoolVar(f"x{i}") for i in S}
+        total = sum(amt[i] * x[i] for i in S)
+        m.Add(total <= tol)
+        m.Add(total >= -tol)
+        taille = sum(x.values())
+        m.Add(taille >= 2)
+        deb = [x[i] for i in S if amt[i] > 0]
+        cre = [x[i] for i in S if amt[i] < 0]
+        m.Add(sum(deb) >= 1)
+        m.Add(sum(cre) >= 1)
+
+        def borne_1n(condition):
+            """Paquet 1:N ou N:1 d'au plus k_max ecritures (si condition)."""
+            z = m.NewBoolVar("un_debit")
+            if condition is None:
+                m.Add(taille <= k_max)
+                m.Add(sum(deb) == 1).OnlyEnforceIf(z)
+                m.Add(sum(cre) == 1).OnlyEnforceIf(z.Not())
+            else:
+                m.Add(taille <= k_max).OnlyEnforceIf(condition)
+                m.Add(sum(deb) == 1).OnlyEnforceIf([condition, z])
+                m.Add(sum(cre) == 1).OnlyEnforceIf([condition, z.Not()])
+
+        iso = None
+        if politique in ("relation", "mixte"):
+            # iso = paquet forme uniquement d'ecritures sans relation
+            iso = m.NewBoolVar("iso")
+            par_acte = {}
+            for i in S:
+                par_acte.setdefault(actes[i], []).append(i)
+            for i in S:
+                if has_rel[i]:
+                    m.AddImplication(x[i], iso.Not())
+                    r = [x[j] for j in relies_dans(i, amt, actes, partners, par_acte)]
+                    if r:
+                        m.Add(sum(r) >= 1).OnlyEnforceIf(x[i])
+                    else:
+                        m.Add(x[i] == 0)   # son partenaire n'est pas dans cet ensemble
+                else:
+                    m.AddImplication(x[i], iso)
+            if politique == "relation":
+                m.Add(taille == 2).OnlyEnforceIf(iso)
+            else:
+                borne_1n(iso)
+            if impose_isole:
+                m.Add(iso == 1)
+        elif politique == "sans_relation":
+            borne_1n(None)
+
+        gmin = gmax = None
+        if avec_dates or span_cap is not None:
+            ds = [days[i] for i in S]
+            lo, hi = min(ds), max(ds)
+            gmin = m.NewIntVar(lo, hi, "gmin")
+            gmax = m.NewIntVar(lo, hi, "gmax")
+            for i in S:
+                m.Add(gmin <= days[i]).OnlyEnforceIf(x[i])
+                m.Add(gmax >= days[i]).OnlyEnforceIf(x[i])
+            if span_cap is not None:
+                m.Add(gmax - gmin <= span_cap)
+        return m, x, taille, gmin, gmax, iso
+
+    def _solveur(time_limit, workers, seed):
+        from ortools.sat.python import cp_model as cp
+        s = cp.CpSolver()
+        s.parameters.max_time_in_seconds = float(time_limit)
+        s.parameters.num_workers = int(workers)
+        s.parameters.random_seed = int(seed)
+        return s
+
+    def plus_petit_paquet(S, amt, days, actes, partners, has_rel, p, span_cap):
+        """Le plus petit paquet valide parmi S (puis le plus resserre si departage).
+        Retourne (membres | None, statut, iso)."""
+        from ortools.sat.python import cp_model as cp
+        m, x, taille, gmin, gmax, iso = construire_modele(
+            S, amt, days, actes, partners, has_rel, p["politique"], p["k_max"],
+            span_cap, p["tol"], p["departage_etendue"])
+        if p["departage_etendue"]:
+            ds = [days[i] for i in S]
+            poids = max(ds) - min(ds) + 1   # la taille domine toujours l'etendue
+            m.Minimize(taille * poids + (gmax - gmin))
+        else:
+            m.Minimize(taille)
+        s = _solveur(p["t_res"], p["workers"], p["seed"])
+        st = s.Solve(m)
+        nom = s.StatusName(st)
+        if st in (cp.OPTIMAL, cp.FEASIBLE):
+            membres = [i for i in S if s.Value(x[i])]
+            return membres, nom, (bool(s.Value(iso)) if iso is not None else None)
+        return None, nom, None
+
+    def a_une_alternative(S, P, amt, days, actes, partners, has_rel, p, span_cap):
+        """Existe-t-il un autre paquet valide sans relation, partageant au moins
+        une ecriture avec P ? Inconnu (limite de temps) => True, par prudence."""
+        from ortools.sat.python import cp_model as cp
+        m, x, taille, gmin, gmax, iso = construire_modele(
+            S, amt, days, actes, partners, has_rel, p["politique"], p["k_max"],
+            span_cap, p["tol"], False, impose_isole=p["politique"] in ("relation", "mixte"))
+        Pset = set(P)
+        m.Add(sum(x[i] for i in P) >= 1)
+        m.Add(sum(1 - x[i] for i in P) + sum(x[i] for i in S if i not in Pset) >= 1)
+        s = _solveur(p["t_res"], p["workers"], p["seed"])
+        st = s.Solve(m)
+        return st != cp.INFEASIBLE
+
+    def decouper(fenetre, has_rel, actes, partners, coherence):
+        """Avec coherence, un paquet ne peut se former qu'a l'interieur d'une
+        composante du graphe des relations, ou parmi les ecritures sans relation.
+        Chaque composante est resolue separement : des modeles bien plus petits.
+        Union-find au niveau des actes ; une sur-fusion reste correcte, car les
+        contraintes de coherence s'appliquent toujours dans le modele."""
+        if not coherence:
+            return [fenetre] if len(fenetre) >= 2 else []
+        parent = {}
+
+        def find(a):
+            while parent.setdefault(a, a) != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        presents = {actes[i] for i in fenetre if has_rel[i]}
+        for a in presents:
+            find(a)
+            for b in partners.get(a, ()):
+                if b in presents:
+                    ra, rb = find(a), find(b)
+                    if ra != rb:
+                        parent[ra] = rb
+        groupes, isoles = {}, []
+        for i in fenetre:
+            if has_rel[i]:
+                groupes.setdefault(find(actes[i]), []).append(i)
+            else:
+                isoles.append(i)
+        out = [g for g in groupes.values() if len(g) >= 2]
+        if len(isoles) >= 2:
+            out.append(isoles)
+        return out
+
+    def lettrer_groupe(amt, days, actes, paires, p, deadline):
+        """Lettre un groupe : passe exacte, puis plus petit paquet d'abord dans des
+        fenetres de dates escaladantes, composante par composante.
+        Retourne (paquets, budget_depasse).
+        Un paquet : dict(membres, statut, base, confiance, passe)."""
+        import bisect
+        import time
+        n = len(amt)
+        partners = partenaires_depuis_paires(paires)
+        has_rel = a_une_relation(amt, actes, partners) if partners else [False] * n
+        politique = p["politique"]
+        coherence = politique in ("relation", "mixte")
+        span_cap = p["span_cap"]
+        restant = set(range(n))
+        paquets = []
+        echecs = []            # ensembles prouves sans aucun paquet valide
+
+        if p["passe_exacte"]:
+            for i, j, base, ambigu in passe_exacte(range(n), amt, days, actes, partners,
+                                                   has_rel, coherence, span_cap):
+                confiance = "AMBIGU" if ambigu else ("RELATION" if base == "RELATION" else "UNIVOQUE")
+                paquets.append(dict(membres=[i, j], statut="EXACT", base=base,
+                                    confiance=confiance, passe="EXACT"))
+                restant.difference_update((i, j))
+
+        def boucle(cand, label, cap):
+            """Extrait les paquets d'un ensemble, du plus petit au plus grand.
+            Retourne True si le budget du groupe est epuise."""
+            nonlocal echecs
+            cand = [i for i in cand if i in restant]
+            while len(cand) >= 2:
+                if time.time() > deadline or len(paquets) >= p["max_paquets"]:
+                    return True
+                if not any(amt[i] > 0 for i in cand) or not any(amt[i] < 0 for i in cand):
+                    return False
+                if len(cand) > p["max_entrees"]:
+                    return False
+                fs = frozenset(cand)
+                if any(fs <= e for e in echecs):
+                    return False
+                membres, statut, iso = plus_petit_paquet(cand, amt, days, actes, partners,
+                                                        has_rel, p, cap)
+                if membres is None:
+                    if statut == "INFEASIBLE":
+                        echecs.append(fs)
+                        echecs = echecs[-64:]
+                    return False
+                if politique == "aucune":
+                    base, confiance = "AUCUNE_REGLE", "NON_EVALUEE"
+                elif politique == "sans_relation" or iso:
+                    base = "SANS_RELATION"
+                    confiance = ("AMBIGU" if a_une_alternative(cand, membres, amt, days, actes,
+                                                                partners, has_rel, p, cap)
+                                 else "UNIVOQUE")
+                else:
+                    base, confiance = "RELATION", "RELATION"
+                paquets.append(dict(membres=membres, statut=statut, base=base,
+                                    confiance=confiance, passe=label))
+                restant.difference_update(membres)
+                cand = [i for i in cand if i in restant]
+            return False
+
+        budget_depasse = False
+        for W in p["fenetres"]:
+            if budget_depasse or len(restant) < 2:
+                break
+            label = "FMAX" if W is None else f"F{W}"
+            cap = span_cap if W is None else (W if span_cap is None else min(W, span_cap))
+            ordre = sorted(restant, key=lambda i: (days[i], i))
+            jours = [days[i] for i in ordre]
+            if W is None:
+                segments = [(None, None)]
+            else:
+                pas = max(1, W // 2)
+                segments = [(a, a + W) for a in range(jours[0], jours[-1] + 1, pas)]
+            for a, b in segments:
+                if a is None:
+                    fenetre = [i for i in ordre if i in restant]
+                else:
+                    lo, hi = bisect.bisect_left(jours, a), bisect.bisect_right(jours, b)
+                    fenetre = [i for i in ordre[lo:hi] if i in restant]
+                for cand in decouper(fenetre, has_rel, actes, partners, coherence):
+                    if boucle(cand, label, cap):
+                        budget_depasse = True
+                        break
+                if budget_depasse:
+                    break
+        return paquets, budget_depasse
+
+    def id_paquet(premier_idx, membres_idx):
+        """Identifiant deterministe d'un paquet (independant du processus Python)."""
+        import hashlib
+        cle = f"{premier_idx}|" + ",".join(str(v) for v in sorted(membres_idx))
+        h = hashlib.sha1(cle.encode()).hexdigest()
+        return f"LTR_{int(h[:15], 16) % 10**14:014d}"
+
+    return dict(passe_exacte=passe_exacte, lettrer_groupe=lettrer_groupe, id_paquet=id_paquet,
+                partenaires_depuis_paires=partenaires_depuis_paires, a_une_relation=a_une_relation)
+
+
+# =============================================================================
+# UDF DISTRIBUEE (traite tous les cas dans un seul applyInPandas)
+# =============================================================================
+
+def _build_solve_udf(spark, cfg: PipelineConfig, bc_rel=None):
+    """
+    Construit et retourne la UDF applyInPandas + le schema de sortie.
+    Broadcast la config pour les executors.
+    bc_rel: broadcast variable contenant le lookup relations (ou None).
+    """
+    from pyspark.sql.types import StructType, StructField, LongType, StringType, IntegerType
+
+    cfg_dict = {
+        "tolerance": cfg.tolerance,
+        "scale": cfg.scale,
+        "objective": cfg.objective,
+        "lexico_delta": cfg.lexico_delta,
+        "num_workers_cpsat": cfg.num_workers_cpsat,
+        "max_iter_per_group": cfg.max_iter_per_group,
+        "min_group_size_cpsat": cfg.min_group_size_cpsat,
+        "max_model_size": cfg.max_model_size,
+        "idx_col": cfg.idx_col,
+        "amount_col": cfg.amount_col,
+        "use_relation_hint": cfg.use_relation_hint,
+        "max_hint_positions": cfg.max_hint_positions,
+        "account_keys": cfg.account_keys,
+        # --- evolutions P1-P6 ---
+        "moteur": cfg.moteur,
+        "router_non_prouves": cfg.router_non_prouves,
+        "passe_exacte": cfg.passe_exacte,
+        "fenetres_jours": list(cfg.fenetres_jours),
+        "ecart_max_jours": cfg.ecart_max_jours,
+        "politique": cfg.politique_coherence,
+        "k_max": cfg.k_max_sans_relation,
+        "router_ambigus": cfg.router_ambigus,
+        "departage_etendue": cfg.departage_etendue,
+        "temps_par_resolution_s": cfg.temps_par_resolution_s,
+        "budget_groupe_s": cfg.budget_groupe_s,
+        "max_paquets_par_groupe": cfg.max_paquets_par_groupe,
+        "max_entrees_par_modele": cfg.max_entrees_par_modele,
+        "r3_scope": [(list(t), c) for t, c in cfg.r3_scope],
+        "max_ecart_jours": cfg.max_ecart_jours,
+        "account_type_col": cfg.account_type_col,
+        "category_type_col": cfg.category_type_col,
+    }
+    bc = spark.sparkContext.broadcast(cfg_dict)
+    engine = _make_engine()   # capture par fermeture : serialise par valeur
+
+    output_schema = StructType([
+        StructField(cfg.idx_col, LongType(), False),
+        StructField("ID_LETTRAGE", StringType(), True),
+        StructField("SOURCE_LETTRAGE", StringType(), False),
+        # P0 : observabilite
+        StructField("STATUT_SOLVEUR", StringType(), True),
+        StructField("BASE_LETTRAGE", StringType(), True),
+        StructField("CONFIANCE", StringType(), True),
+        StructField("PASSE", StringType(), True),
+        StructField("TAILLE_PAQUET", IntegerType(), True),
+    ])
+
+    def solve_group_udf(pdf):
+        """
+        UDF autosuffisante : recoit un groupe complet (pandas DF),
+        retourne une ligne par poste.
+
+        Logique :
+          - singleton (n=1)              -> NON_TRAITE
+          - trop gros (n>max_model)      -> NON_TRAITE
+          - mono-signe (pas D/C mix)     -> RESIDUEL
+          - moteur legacy                -> [EXACT] + CP_SAT|A_REVOIR (un paquet) + RESIDUEL
+          - moteur smallest_first        -> EXACT + CP_SAT|A_REVOIR (paquets) + RESIDUEL
+        """
+        import time as _time
+        import numpy as np
+        import pandas as pd
+        from ortools.sat.python import cp_model as _cp
+
+        c = bc.value
+        idx_col = c["idx_col"]
+        amount_col = c["amount_col"]
+        scale = c["scale"]
+        tol_scaled = int(round(c["tolerance"] * scale))
+        num_workers = c["num_workers_cpsat"]
+        max_iter = c["max_iter_per_group"]
+        objective = c["objective"]
+        lexico_delta = c["lexico_delta"]
+        min_size = c["min_group_size_cpsat"]
+        max_model = c["max_model_size"]
+
+        indices = pdf[idx_col].values
+        amounts = pdf[amount_col].values.astype(np.float64)
+        n = len(amounts)
+
+        # Timeout adaptatif (transmis via la colonne _timeout_s)
+        time_limit = int(pdf["_timeout_s"].iloc[0]) if "_timeout_s" in pdf.columns else 30
+
+        # --- Construction du resultat ---
+        source = ["RESIDUEL"] * n
+        id_ltr = [None] * n
+        statut = [None] * n
+        base = [None] * n
+        confiance = [None] * n
+        passe = [None] * n
+        taille = [None] * n
+
+        def _resultat():
+            return pd.DataFrame({
+                idx_col: indices,
+                "ID_LETTRAGE": pd.array(id_ltr, dtype="object"),
+                "SOURCE_LETTRAGE": source,
+                "STATUT_SOLVEUR": pd.array(statut, dtype="object"),
+                "BASE_LETTRAGE": pd.array(base, dtype="object"),
+                "CONFIANCE": pd.array(confiance, dtype="object"),
+                "PASSE": pd.array(passe, dtype="object"),
+                "TAILLE_PAQUET": pd.array(taille, dtype="Int32"),
+            })
+
+        def _make_result(source_val):
+            source[:] = [source_val] * n
+            return _resultat()
+
+        def _source_de(st, conf):
+            src = "EXACT" if st == "EXACT" else "CP_SAT"
+            if c["router_non_prouves"] and st not in ("OPTIMAL", "EXACT"):
+                src = "A_REVOIR"
+            if c["router_ambigus"] and conf == "AMBIGU":
+                src = "A_REVOIR"
+            return src
+
+        def _ecrire_paquet(membres, gid, st, b, conf, ps):
+            src = _source_de(st, conf)
+            for i in membres:
+                source[i], id_ltr[i], statut[i] = src, gid, st
+                base[i], confiance[i], passe[i], taille[i] = b, conf, ps, len(membres)
+
+        if n == 1:
+            return _make_result("NON_TRAITE")
+        if n > max_model:
+            return _make_result("NON_TRAITE")
+
+        has_pos = (amounts > 0).any()
+        has_neg = (amounts < 0).any()
+        if not has_pos or not has_neg:
+            return _make_result("RESIDUEL")
+
+        if n < min_size:
+            return _make_result("RESIDUEL")
+
+        # --- Relations du compte (hints, passe exacte, coherence) ---
+        paires_compte = []
+        acte_col_name = "_acte_norm"
+        actes = [""] * n
+        if acte_col_name in pdf.columns:
+            actes = [str(a).strip().lower() if a and str(a).strip() else "" for a in pdf[acte_col_name].values]
+        if bc_rel is not None:
+            try:
+                rel_data = bc_rel.value
+                rel_keys = rel_data["keys"]
+                acc_key = tuple(
+                    str(pdf[k].iloc[0]).strip() if k in pdf.columns else ""
+                    for k in rel_keys
+                )
+                paires_compte = rel_data["lookup"].get(acc_key, [])
+            except Exception:
+                paires_compte = []
+
+        # --- Calcul des hints relation d'actes (moteur legacy) ---
+        hint_indices = []
+        if c["use_relation_hint"] and paires_compte and acte_col_name in pdf.columns:
+            try:
+                acte_to_positions = {}
+                for pos, s in enumerate(actes):
+                    if s:
+                        acte_to_positions.setdefault(s, []).append(pos)
+                hint_positions = set()
+                for a1, a2 in paires_compte:
+                    if a1 in acte_to_positions and a2 in acte_to_positions:
+                        for p in acte_to_positions[a1]:
+                            hint_positions.add(p)
+                        for p in acte_to_positions[a2]:
+                            hint_positions.add(p)
+                max_h = c["max_hint_positions"]
+                hint_indices = list(hint_positions)[:max_h]
+            except Exception:
+                hint_indices = []
+
+        days = (pdf["_jour"].values.astype(np.int64).tolist() if "_jour" in pdf.columns else [0] * n)
+        first_idx = int(indices[0])
+
+        # =================================================================
+        # MOTEUR SMALLEST_FIRST (P3-P6)
+        # =================================================================
+        if c["moteur"] == "smallest_first":
+            amt = [int(round(m * scale)) for m in amounts]
+            caps = [c["ecart_max_jours"]]
+            if c["r3_scope"] and c["account_type_col"] in pdf.columns and c["category_type_col"] in pdf.columns:
+                at = pdf[c["account_type_col"]].astype(str).values
+                ct = pdf[c["category_type_col"]].astype(str).values
+                dans_r3 = False
+                for types, cat in c["r3_scope"]:
+                    if (np.isin(at, [str(t) for t in types]) & (ct == str(cat))).any():
+                        dans_r3 = True
+                        break
+                if dans_r3:
+                    caps.append(c["max_ecart_jours"])
+            caps = [v for v in caps if v is not None]
+            params = dict(
+                passe_exacte=c["passe_exacte"], politique=c["politique"], fenetres=c["fenetres_jours"],
+                span_cap=min(caps) if caps else None, k_max=c["k_max"], tol=tol_scaled,
+                departage_etendue=c["departage_etendue"], t_res=c["temps_par_resolution_s"],
+                workers=num_workers, seed=42, max_paquets=c["max_paquets_par_groupe"],
+                max_entrees=c["max_entrees_par_modele"],
+            )
+            budget = c["budget_groupe_s"] if c["budget_groupe_s"] else 4 * time_limit
+            paquets, depasse = engine["lettrer_groupe"](amt, days, actes, paires_compte, params,
+                                                       _time.time() + budget)
+            for pq in paquets:
+                gid = engine["id_paquet"](first_idx, [int(indices[i]) for i in pq["membres"]])
+                _ecrire_paquet(pq["membres"], gid, pq["statut"], pq["base"], pq["confiance"], pq["passe"])
+            if depasse:
+                for i in range(n):
+                    if id_ltr[i] is None:
+                        statut[i] = "BUDGET_DEPASSE"
+            return _resultat()
+
+        # =================================================================
+        # MOTEUR LEGACY (comportement historique, inchange si P1/P2 inactifs)
+        # =================================================================
+        positions_legacy = list(range(n))
+        if c["passe_exacte"]:
+            amt_ex = [int(round(m * scale)) for m in amounts]
+            partners = engine["partenaires_depuis_paires"](paires_compte)
+            has_rel = engine["a_une_relation"](amt_ex, actes, partners) if partners else [False] * n
+            used = set()
+            for i, j, b, ambigu in engine["passe_exacte"](range(n), amt_ex, days, actes, partners,
+                                                          has_rel, False, c["ecart_max_jours"]):
+                conf = "AMBIGU" if ambigu else ("RELATION" if b == "RELATION" else "UNIVOQUE")
+                gid = engine["id_paquet"](first_idx, [int(indices[i]), int(indices[j])])
+                _ecrire_paquet([i, j], gid, "EXACT", b, conf, "EXACT")
+                used.update((i, j))
+            positions_legacy = [i for i in range(n) if i not in used]
+
+        # --- CP-SAT Solve ---
+        def _solve_once(mnt_scaled, signes, obj_mode, min_count=None, hints=None):
+            nn = len(mnt_scaled)
+            model = _cp.CpModel()
+            x = [model.NewBoolVar(f"x_{i}") for i in range(nn)]
+
+            s_min = sum(int(m) for m in mnt_scaled if m < 0)
+            s_max = sum(int(m) for m in mnt_scaled if m > 0)
+            sum_var = model.NewIntVar(s_min, s_max, "s")
+            model.Add(sum_var == sum(int(mnt_scaled[i]) * x[i] for i in range(nn)))
+            model.Add(sum_var >= -tol_scaled)
+            model.Add(sum_var <= tol_scaled)
+
+            model.Add(sum(x) >= min_size)
+            idx_p = [i for i in range(nn) if signes[i] == "D"]
+            idx_n = [i for i in range(nn) if signes[i] == "C"]
+            if not idx_p or not idx_n:
+                return [], "NO_MIX"
+            model.Add(sum(x[i] for i in idx_p) >= 1)
+            model.Add(sum(x[i] for i in idx_n) >= 1)
+
+            if min_count is not None:
+                model.Add(sum(x) >= min_count)
+
+            if obj_mode == "max_count":
+                model.Maximize(sum(x))
+            elif obj_mode == "max_volume":
+                abs_m = [abs(int(m)) for m in mnt_scaled]
+                model.Maximize(sum(abs_m[i] * x[i] for i in range(nn)))
+
+            solver = _cp.CpSolver()
+            solver.parameters.max_time_in_seconds = time_limit
+            solver.parameters.num_search_workers = num_workers
+
+            # Hints: guider le solveur vers les postes ayant une relation connue
+            if hints:
+                for i in hints:
+                    if 0 <= i < nn:
+                        model.AddHint(x[i], 1)
+
+            status = solver.Solve(model)
+
+            if status in (_cp.OPTIMAL, _cp.FEASIBLE):
+                return [i for i in range(nn) if solver.Value(x[i]) == 1], solver.StatusName(status)
+            return [], solver.StatusName(status)
+
+        # --- Iterative solving ---
+        all_selected = set()
+        statuts_retenus = []
+        remaining = list(positions_legacy)
+
+        for _ in range(max_iter):
+            if len(remaining) < min_size:
+                break
+
+            r_amounts = amounts[remaining]
+            r_scaled = [int(round(m * scale)) for m in r_amounts]
+            r_signes = ["D" if m > 0 else "C" for m in r_amounts]
+
+            if "D" not in r_signes or "C" not in r_signes:
+                break
+
+            # Remapper hint_indices aux positions locales dans remaining
+            local_hints = None
+            if hint_indices:
+                remaining_set = set(remaining)
+                remaining_to_local = {orig: loc for loc, orig in enumerate(remaining)}
+                local_hints = [remaining_to_local[h] for h in hint_indices if h in remaining_set]
+                if not local_hints:
+                    local_hints = None
+
+            if objective == "max_count":
+                sel, st = _solve_once(r_scaled, r_signes, "max_count", hints=local_hints)
+            elif objective == "max_volume":
+                sel, st = _solve_once(r_scaled, r_signes, "max_volume", hints=local_hints)
+            elif objective == "lexicographic":
+                sel_p1, st1 = _solve_once(r_scaled, r_signes, "max_count", hints=local_hints)
+                if not sel_p1:
+                    break
+                min_c = max(min_size, len(sel_p1) - lexico_delta)
+                sel, st = _solve_once(r_scaled, r_signes, "max_volume", min_count=min_c, hints=local_hints)
+                if not sel:
+                    sel, st = sel_p1, st1
+            else:
+                sel, st = [], "OBJECTIF_INCONNU"
+
+            if not sel:
+                break
+
+            statuts_retenus.append(st)
+            for local_i in sel:
+                all_selected.add(remaining[local_i])
+            remaining = [i for i in remaining if i not in all_selected]
+
+        # --- Build output ---
+        if all_selected:
+            # ID stable : hash du premier _idx + selection (formule historique inchangee)
+            sel_sample = tuple(sorted(indices[list(all_selected)][:8].tolist()))
+            id_hash = abs(hash((first_idx, sel_sample))) % 10**14
+            group_id = f"LTR_{id_hash:014d}"
+            st_final = "OPTIMAL" if all(s == "OPTIMAL" for s in statuts_retenus) else "FEASIBLE"
+            _ecrire_paquet(sorted(all_selected), group_id, st_final, "NON_DEFINIE", "NON_EVALUEE", "LEGACY")
+
+        return _resultat()
+
+    return solve_group_udf, output_schema
+
+
+# =============================================================================
+# PRE-FILTRE RELATION D'ACTES (optionnel)
+# =============================================================================
+
+def filtrer_par_relation(spark, df, cfg: PipelineConfig):
+    """
+    Exclut les groupes sans aucune relation d'actes connue.
+    Retourne le df filtre (postes des groupes ayant au moins 1 relation).
+    Les postes exclus recevront SOURCE_LETTRAGE='NON_TRAITE' a la fin.
+    """
+    from pyspark.sql import functions as F
+
+    try:
+        df_rel = spark.table(cfg.relation_table)
+    except Exception as e:
+        log.warning(f"Table relations inaccessible ({e}) - filtre desactive")
+        return df, set()
+
+    df_rel = (
+        df_rel
+        .withColumn("_a1", _norm_acte_expr(F.col(cfg.rel_act1_col), cfg.acte_prefix_pattern))
+        .withColumn("_a2", _norm_acte_expr(F.col(cfg.rel_act2_col), cfg.acte_prefix_pattern))
+    )
+
+    # Actes par groupe
+    df_actes = df.groupBy(cfg.account_keys).agg(
+        F.collect_set(F.col("_acte_norm")).alias("_actes_set")
+    )
+
+    # Jointure sur cles communes
+    join_keys = [k for k in cfg.account_keys if k in df_rel.columns]
+    if not join_keys:
+        return df, set()
+
+    df_rel_slim = df_rel.select(join_keys + ["_a1", "_a2"]).distinct()
+    df_match = (
+        df_actes.join(df_rel_slim, on=join_keys)
+        .filter(
+            F.array_contains(F.col("_actes_set"), F.col("_a1"))
+            & F.array_contains(F.col("_actes_set"), F.col("_a2"))
+        )
+        .select(cfg.account_keys).distinct()
+    )
+
+    n_avant = df.select(cfg.account_keys).distinct().count()
+    df_filtre = df.join(df_match, on=cfg.account_keys, how="inner")
+    n_apres = df_filtre.select(cfg.account_keys).distinct().count()
+
+    log.info(f"  Filtre relation: {n_avant:,} -> {n_apres:,} groupes ({n_avant-n_apres:,} exclus)")
+    return df_filtre, df_match
+
+
+# =============================================================================
+# POST-PROCESSING : COHERENCE + SCORE RELATION
+# =============================================================================
+
+def postprocess(spark, df_detail, cfg: PipelineConfig):
+    """
+    Calcule sur la table de sortie finale :
+      - df_stats      : 1 ligne/account_keys (volumetrie + worst-case coherence)
+      - df_coherence  : 1 ligne/ID_LETTRAGE (flags de coherence + score relation)
+
+    Les flags dont les colonnes ou la configuration manquent valent 0
+    (regle desactivee) au lieu de faire echouer le post-processing.
+    """
+    from pyspark.sql import functions as F
+
+    log.info("Post-processing: coherence + score relation...")
+    t0 = time.time()
+    amount_col = cfg.amount_col
+    cols = set(df_detail.columns)
+
+    # --- Stats par compte ---
+    df_stats = (
+        df_detail.groupBy(*cfg.account_keys)
+        .agg(
+            F.count("*").alias("nb_postes_total"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE").isin("CP_SAT", "EXACT"), 1).otherwise(0)).alias("nb_lettres"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE") == "EXACT", 1).otherwise(0)).alias("nb_exact"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE") == "A_REVOIR", 1).otherwise(0)).alias("nb_a_revoir"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE") == "RESIDUEL", 1).otherwise(0)).alias("nb_residuels"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE") == "NON_TRAITE", 1).otherwise(0)).alias("nb_non_traites"),
+            F.sum(F.when(F.col("SOURCE_LETTRAGE").isin("CP_SAT", "EXACT"), F.abs(F.col(amount_col))).otherwise(0)).alias("volume_lettre"),
+            F.sum(F.abs(F.col(amount_col))).alias("volume_total"),
+        )
+        .withColumn("taux_lettrage_pct", F.round(F.col("nb_lettres") / F.col("nb_postes_total") * 100, 2))
+    )
+
+    # --- Coherence par ID_LETTRAGE (tous les paquets : CP_SAT, EXACT, A_REVOIR) ---
+    df_cpsat = df_detail.filter(F.col("ID_LETTRAGE").isNotNull())
+    if df_cpsat.rdd.isEmpty():
+        log.warning("Aucun paquet")
+        return df_stats, None
+
+    has_date = cfg.posting_date_col in cols
+    has_doc = cfg.doc_type_col in cols
+    has_ext = cfg.external_ref_col in cols
+
+    aggs = [
+        F.count("*").alias("NB_POSTES_GRP"),
+        F.round(F.sum(amount_col), 4).alias("SOMME_NETTE"),
+        F.sum(F.when(F.col(amount_col) > 0, 1).otherwise(0)).alias("NB_DEBITS"),
+        F.sum(F.when(F.col(amount_col) < 0, 1).otherwise(0)).alias("NB_CREDITS"),
+    ]
+    if cfg.partner_col in cols:
+        aggs.append(F.countDistinct(cfg.partner_col).alias("NB_PARTNERS"))
+    if has_ext:
+        aggs.append(F.countDistinct(cfg.external_ref_col).alias("NB_EXT_REFS"))
+    if cfg.main_txn_col in cols:
+        aggs.append(F.countDistinct(cfg.main_txn_col).alias("NB_MAIN_TXN"))
+    if has_date:
+        aggs.append(F.datediff(F.max(cfg.posting_date_col), F.min(cfg.posting_date_col)).alias("ECART_JOURS"))
+    if has_doc and cfg.r1_doc_types:
+        aggs.append(F.sum(F.when(F.col(cfg.doc_type_col).isin(cfg.r1_doc_types), 1).otherwise(0)).alias("_r1_docs"))
+    if has_doc and cfg.r2_doc_types:
+        aggs.append(F.sum(F.when(F.col(cfg.doc_type_col).isin(cfg.r2_doc_types), 1).otherwise(0)).alias("_r2_docs"))
+    # P0 : statut, base, confiance et passe de chaque paquet (identiques pour tous ses membres)
+    for c_ in ("SOURCE_LETTRAGE", "STATUT_SOLVEUR", "BASE_LETTRAGE", "CONFIANCE", "PASSE"):
+        if c_ in cols:
+            aggs.append(F.first(c_, ignorenulls=True).alias(c_))
+
+    df_coherence = (
+        df_cpsat.groupBy("ID_LETTRAGE").agg(*aggs)
+        .withColumn("OK_SOMME", (F.abs(F.col("SOMME_NETTE")) <= cfg.tolerance).cast("int"))
+        .withColumn("OK_MIX_DC", ((F.col("NB_DEBITS") > 0) & (F.col("NB_CREDITS") > 0)).cast("int"))
+    )
+    coh_cols = set(df_coherence.columns)
+    if "NB_PARTNERS" in coh_cols:
+        df_coherence = df_coherence.withColumn("OK_MONO_PARTNER", (F.col("NB_PARTNERS") == 1).cast("int"))
+    if "NB_EXT_REFS" in coh_cols:
+        df_coherence = df_coherence.withColumn("OK_MONO_EXT_REF", (F.col("NB_EXT_REFS") == 1).cast("int"))
+
+    # R1 : types de piece r1 presents et ecart > r1_max_days
+    if "_r1_docs" in coh_cols and "ECART_JOURS" in coh_cols:
+        df_coherence = df_coherence.withColumn("KO_R1",
+            ((F.col("_r1_docs") > 0) & (F.col("ECART_JOURS") > cfg.r1_max_days)).cast("int"))
+    else:
+        df_coherence = df_coherence.withColumn("KO_R1", F.lit(0))
+
+    # R2 : groupe entierement compose de types r2 avec plusieurs references externes
+    if "_r2_docs" in coh_cols and "NB_EXT_REFS" in coh_cols:
+        df_coherence = df_coherence.withColumn("KO_R2",
+            ((F.col("_r2_docs") == F.col("NB_POSTES_GRP")) & (F.col("NB_EXT_REFS") > 1)).cast("int"))
+    else:
+        df_coherence = df_coherence.withColumn("KO_R2", F.lit(0))
+
+    df_coherence = df_coherence.drop(*[c for c in ("_r1_docs", "_r2_docs") if c in coh_cols])
+
+    # --- KO_R3_TEMPOREL : applicable uniquement au perimetre r3_scope ---
+    r3_ready = (cfg.r3_scope and "ECART_JOURS" in coh_cols
+                and cfg.account_type_col in cols and cfg.category_type_col in cols)
+    if r3_ready:
+        _r3_filter = None
+        for account_types, category in cfg.r3_scope:
+            c_ = F.col(cfg.account_type_col).isin(list(account_types)) & (F.col(cfg.category_type_col) == category)
+            _r3_filter = c_ if _r3_filter is None else (_r3_filter | c_)
+        # Identifier les ID_LETTRAGE dans le perimetre R3
+        df_r3_ids = (
+            df_cpsat.filter(_r3_filter)
+            .select("ID_LETTRAGE").distinct()
+            .withColumn("_in_r3_scope", F.lit(True))
+        )
+        df_coherence = df_coherence.join(df_r3_ids, on="ID_LETTRAGE", how="left")
+        df_coherence = df_coherence.withColumn("KO_R3_TEMPOREL",
+            F.when(
+                F.col("_in_r3_scope") & (F.col("ECART_JOURS") > cfg.max_ecart_jours), 1
+            ).otherwise(0).cast("int")
+        ).drop("_in_r3_scope")
+    else:
+        df_coherence = df_coherence.withColumn("KO_R3_TEMPOREL", F.lit(0))
+
+    # --- Score relation ---
+    acte_expr = (F.col("_acte_norm") if "_acte_norm" in df_cpsat.columns
+                 else _norm_acte_expr(F.col(cfg.acte_col), cfg.acte_prefix_pattern))
+    grp_keys = ["ID_LETTRAGE"] + [k for k in cfg.account_keys if k in df_cpsat.columns]
+    df_actes_grp = df_cpsat.groupBy(grp_keys).agg(F.collect_set(acte_expr).alias("_actes_set"))
+
+    try:
+        df_rel = (
+            spark.table(cfg.relation_table)
+            .withColumn("_a1", _norm_acte_expr(F.col(cfg.rel_act1_col), cfg.acte_prefix_pattern))
+            .withColumn("_a2", _norm_acte_expr(F.col(cfg.rel_act2_col), cfg.acte_prefix_pattern))
+            .withColumn("_def", F.coalesce(F.col(cfg.rel_default_col).cast("int"), F.lit(0)))
+        )
+        jk = [k for k in cfg.account_keys if k in df_rel.columns]
+        if jk:
+            df_rs = df_rel.select(jk + ["_a1", "_a2", "_def"]).distinct()
+            df_sc = (
+                df_actes_grp.join(df_rs, on=jk, how="left")
+                .withColumn("_m",
+                    F.when(
+                        F.array_contains(F.col("_actes_set"), F.col("_a1"))
+                        & F.array_contains(F.col("_actes_set"), F.col("_a2")),
+                        F.when(F.col("_def") == 1, 2).otherwise(1)
+                    ).otherwise(0)
+                )
+                .groupBy("ID_LETTRAGE").agg(F.max("_m").alias("SCORE_RELATION"))
+                .withColumn("LABEL_RELATION",
+                    F.when(F.col("SCORE_RELATION") == 2, "DEFAULT")
+                    .when(F.col("SCORE_RELATION") == 1, "SECONDAIRE")
+                    .otherwise("INCONNUE")
+                )
+            )
+        else:
+            df_sc = df_actes_grp.select("ID_LETTRAGE").distinct()
+            df_sc = df_sc.withColumn("SCORE_RELATION", F.lit(0)).withColumn("LABEL_RELATION", F.lit("INCONNUE"))
+    except Exception:
+        df_sc = df_actes_grp.select("ID_LETTRAGE").distinct()
+        df_sc = df_sc.withColumn("SCORE_RELATION", F.lit(0)).withColumn("LABEL_RELATION", F.lit("INCONNUE"))
+
+    df_coherence = df_coherence.join(df_sc, on="ID_LETTRAGE", how="left")
+    df_coherence = df_coherence.fillna({"SCORE_RELATION": 0, "LABEL_RELATION": "INCONNUE"})
+
+    # --- Enrichir stats ---
+    df_id_keys = df_cpsat.select(["ID_LETTRAGE"] + cfg.account_keys).distinct()
+    df_coh_k = df_coherence.join(df_id_keys, on="ID_LETTRAGE")
+    df_agg = df_coh_k.groupBy(cfg.account_keys).agg(
+        F.min("OK_SOMME").alias("min_OK_SOMME"),
+        F.min("OK_MIX_DC").alias("min_OK_MIX_DC"),
+        F.max("KO_R1").alias("max_KO_R1"),
+        F.max("KO_R2").alias("max_KO_R2"),
+        F.max("KO_R3_TEMPOREL").alias("max_KO_R3_TEMPOREL"),
+        F.max("SCORE_RELATION").alias("best_SCORE_RELATION"),
+    )
+
+    df_stats = df_stats.join(df_agg, on=cfg.account_keys, how="left")
+
+    log.info(f"  Post-processing: {time.time()-t0:.1f}s")
+    return df_stats, df_coherence
+
+
+# =============================================================================
+# HISTORIQUE DES RUNS (metriques persistees pour comparaison)
+# =============================================================================
+
+def _save_run_history(spark, cfg: PipelineConfig, metrics: dict):
+    """
+    Persiste les metriques du run dans une table Delta append-only.
+    Chaque run = 1 ligne avec timestamp, config, durees, volumes.
+    """
+    from pyspark.sql import Row
+    from datetime import datetime
+
+    row = Row(
+        run_ts=datetime.now().isoformat(),
+        run_label=cfg.run_label or "default",
+        input_table=cfg.input_table,
+        output_table=cfg.output_table,
+        tolerance=cfg.tolerance,
+        objective=cfg.objective,
+        max_model_size=cfg.max_model_size,
+        timeout_min=cfg.timeout_min,
+        timeout_max=cfg.timeout_max,
+        filtre_relation=cfg.filtre_relation_actes,
+        test_limit=cfg.test_limit or -1,
+        nb_input=metrics.get("nb_input", 0),
+        nb_cp_sat=metrics.get("nb_cp_sat", 0),
+        nb_residuel=metrics.get("nb_residuel", 0),
+        nb_non_traite=metrics.get("nb_non_traite", 0),
+        taux_lettrage_pct=round(metrics.get("taux_pct", 0.0), 2),
+        duree_total_s=round(metrics.get("duree_total_s", 0.0), 1),
+        duree_chargement_s=round(metrics.get("duree_chargement_s", 0.0), 1),
+        duree_solve_s=round(metrics.get("duree_solve_s", 0.0), 1),
+        duree_postprocess_s=round(metrics.get("duree_postprocess_s", 0.0), 1),
+        n_groupes=metrics.get("n_groupes", 0),
+        n_partitions=metrics.get("n_partitions", 0),
+        groupes_par_sec=round(metrics.get("groupes_par_sec", 0.0), 2),
+        # P0 / evolutions
+        moteur=cfg.moteur,
+        politique_coherence=cfg.politique_coherence,
+        passe_exacte=cfg.passe_exacte,
+        nb_exact=metrics.get("nb_exact", 0),
+        nb_a_revoir=metrics.get("nb_a_revoir", 0),
+        nb_paquets=metrics.get("nb_paquets", 0),
+        nb_paquets_non_prouves=metrics.get("nb_paquets_non_prouves", 0),
+        nb_budget_depasse=metrics.get("nb_budget_depasse", 0),
+    )
+
+    df_row = spark.createDataFrame([row])
+    df_row.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(cfg.runs_history_table)
+    log.info(f"  Run log -> {cfg.runs_history_table}")
+
+
+# =============================================================================
+# POINT D'ENTREE UNIQUE : run_pipeline
+# =============================================================================
+
+def run_pipeline(spark, cfg: PipelineConfig):
+    """
+    Pipeline distribue complet :
+      1. Charge et nettoie (1 seul scan)
+      2. Classifie (taille + timeout)
+      3. Optionnel: filtre relation d'actes
+      4. Solve distribue (applyInPandas, tous les groupes)
+      5. Enrichit la table source avec SOURCE_LETTRAGE + ID_LETTRAGE
+      6. Ecrit 1 seule table de sortie
+      7. Post-processing coherence + score
+
+    Retourne (df_detail, df_stats, df_coherence)
+    """
+    from pyspark.sql import functions as F
+
+    _valider_config(cfg)
+
+    log.info("=" * 70)
+    log.info("  PIPELINE LETTRAGE DISTRIBUE (v3)")
+    log.info("=" * 70)
+    log.info(f"  Input      : {cfg.input_table}")
+    log.info(f"  Output     : {cfg.output_table}")
+    log.info(f"  Objective  : {cfg.objective}")
+    log.info(f"  Tolerance  : {cfg.tolerance}")
+    log.info(f"  Max model  : {cfg.max_model_size} postes")
+    log.info(f"  Timeout    : {cfg.timeout_min}-{cfg.timeout_max}s (adaptatif)")
+    log.info(f"  Relation   : {cfg.filtre_relation_actes}")
+    log.info(f"  Hints      : {cfg.use_relation_hint} (max {cfg.max_hint_positions} pos)")
+    log.info(f"  Moteur     : {cfg.moteur} | passe exacte={cfg.passe_exacte} | "
+             f"non prouves->revue={cfg.router_non_prouves}")
+    if cfg.moteur == "smallest_first":
+        log.info(f"  Coherence  : {cfg.politique_coherence} (k_max sans relation={cfg.k_max_sans_relation}) | "
+                 f"ambigus->revue={cfg.router_ambigus}")
+        log.info(f"  Fenetres   : {cfg.fenetres_jours} | ecart max={cfg.ecart_max_jours} | "
+                 f"departage etendue={cfg.departage_etendue}")
+    if cfg.test_limit:
+        log.info(f"  Test limit : {cfg.test_limit} groupes")
+    log.info("=" * 70)
+
+    t_start = time.time()
+    timings = {}
+
+    # --- 1. Chargement unique ---
+    t1 = time.time()
+    df, nb_total = charger_et_nettoyer(spark, cfg)
+    timings["chargement"] = time.time() - t1
+
+    # --- 1b. Filtre comptes cibles (optionnel, pour test rapide) ---
+    if cfg.filter_accounts:
+        if isinstance(cfg.filter_accounts, dict):
+            # Format dict : filtre chaque cle independamment
+            for key, values in cfg.filter_accounts.items():
+                if key in df.columns and values:
+                    df = df.filter(F.col(key).isin(values))
+            log.info(f"  Filtre comptes (dict): {nb_total:,} -> ... (filtres: {list(cfg.filter_accounts.keys())})")
+        elif isinstance(cfg.filter_accounts, (list, tuple)):
+            # Format list de tuples : combinaisons exactes sur account_keys
+            keys = cfg.account_keys
+            conditions = []
+            for grp in cfg.filter_accounts:
+                if isinstance(grp, (list, tuple)) and len(grp) == len(keys):
+                    cond = F.lit(True)
+                    for k, v in zip(keys, grp):
+                        if k in df.columns:
+                            cond = cond & (F.col(k) == v)
+                    conditions.append(cond)
+            if conditions:
+                from functools import reduce
+                df = df.filter(reduce(lambda a, b: a | b, conditions))
+            log.info(f"  Filtre comptes (list): {nb_total:,} -> ... ({len(cfg.filter_accounts)} groupes cibles)")
+        nb_filtre = df.count()
+        log.info(f"  Apres filtre: {nb_filtre:,} postes")
+        nb_total = nb_filtre
+
+    # --- 2. Classification (taille + timeout adaptatif) ---
+    df = classifier_groupes(df, cfg)
+
+    # --- 3. Filtre relation d'actes (optionnel) ---
+    # Les postes exclus par ce filtre recevront NON_TRAITE
+    # (car ils ne sont plus dans df_to_solve, on les re-ajoute apres)
+    if cfg.filtre_relation_actes:
+        df_to_solve, df_match_keys = filtrer_par_relation(spark, df, cfg)
+    else:
+        df_to_solve = df
+        df_match_keys = None
+
+    # --- 4. Test limit ---
+    if cfg.test_limit:
+        # Limiter au N premiers groupes distincts
+        df_keys = df_to_solve.select(cfg.account_keys).distinct().limit(cfg.test_limit)
+        df_to_solve = df_to_solve.join(df_keys, on=cfg.account_keys, how="inner")
+        log.info(f"  Test limit: {cfg.test_limit} groupes")
+
+    # --- 5. Partitionnement ---
+    n_groups = df_to_solve.select(cfg.account_keys).distinct().count()
+    n_partitions = min(cfg.n_partitions_hint, max(n_groups // 5, 50))
+    cols_solve = cfg.account_keys + [cfg.idx_col, cfg.amount_col, "_grp_size", "_timeout_s"]
+    # Ajouter _acte_norm si les relations sont utilisees dans la UDF (hints, passe exacte, coherence)
+    if _relations_requises(cfg) and "_acte_norm" in df_to_solve.columns:
+        cols_solve = cols_solve + ["_acte_norm"]
+    # Dates en jours : fenetres, departage, passe exacte
+    if (cfg.moteur == "smallest_first" or cfg.passe_exacte) and "_jour" in df_to_solve.columns:
+        cols_solve = cols_solve + ["_jour"]
+    # Perimetre R3 : limite dure d'etendue pour les groupes concernes
+    if cfg.moteur == "smallest_first" and cfg.r3_scope:
+        cols_solve = cols_solve + [c for c in (cfg.account_type_col, cfg.category_type_col)
+                                   if c in df_to_solve.columns and c not in cols_solve]
+    df_ready = df_to_solve.select(*cols_solve).repartition(n_partitions, *cfg.account_keys)
+    log.info(f"  {n_groups:,} groupes | {n_partitions} partitions")
+
+    # --- 6. Solve distribue ---
+    bc_rel = _build_relation_broadcast(spark, cfg)
+    solve_udf, output_schema = _build_solve_udf(spark, cfg, bc_rel=bc_rel)
+
+    log.info("  Lancement applyInPandas...")
+    t_solve = time.time()
+    df_solved = df_ready.groupBy(*cfg.account_keys).applyInPandas(solve_udf, schema=output_schema)
+    df_solved.cache()
+
+    n_solved = df_solved.count()
+    timings["solve"] = time.time() - t_solve
+    comptes = {r["SOURCE_LETTRAGE"]: r["count"] for r in df_solved.groupBy("SOURCE_LETTRAGE").count().collect()}
+    n_cpsat = comptes.get("CP_SAT", 0)
+    n_exact = comptes.get("EXACT", 0)
+    n_a_revoir = comptes.get("A_REVOIR", 0)
+    n_resid = comptes.get("RESIDUEL", 0)
+    n_nt = comptes.get("NON_TRAITE", 0)
+    n_lettres = n_cpsat + n_exact
+    # P0 : paquets et paquets sans preuve d'optimalite
+    df_pq = df_solved.filter(F.col("ID_LETTRAGE").isNotNull()).select("ID_LETTRAGE", "STATUT_SOLVEUR").distinct()
+    n_paquets = df_pq.count()
+    n_non_prouves = df_pq.filter(~F.col("STATUT_SOLVEUR").isin("OPTIMAL", "EXACT")).count()
+    n_budget = df_solved.filter(F.col("STATUT_SOLVEUR") == "BUDGET_DEPASSE").count()
+    log.info(f"  Solved: {n_solved:,} postes | CP_SAT={n_cpsat:,} | EXACT={n_exact:,} | A_REVOIR={n_a_revoir:,} "
+             f"| RESIDUEL={n_resid:,} | NON_TRAITE={n_nt:,}")
+    log.info(f"  Paquets: {n_paquets:,} | sans preuve d'optimalite: {n_non_prouves:,} "
+             f"| postes laisses par budget depasse: {n_budget:,}")
+
+    # --- 7. Enrichir avec toutes les colonnes source ---
+    cols_from_solved = ["SOURCE_LETTRAGE", "ID_LETTRAGE"]
+    df_source = df.drop(*[c for c in cols_from_solved if c in df.columns])
+    df_source = df_source.drop("_grp_size", "_timeout_s", "_jour")  # colonnes techniques
+
+    df_detail = df_source.join(df_solved, on=cfg.idx_col, how="left")
+
+    # Postes non traites par le solve (filtre relation exclu) -> NON_TRAITE
+    df_detail = df_detail.withColumn("SOURCE_LETTRAGE",
+        F.coalesce(F.col("SOURCE_LETTRAGE"), F.lit("NON_TRAITE"))
+    )
+
+    # Materialisation : la resolution n'est executee qu'une fois. Sans cela, chaque
+    # usage du df retourne (toPandas, jointure dans le notebook appelant...) relance
+    # toute la resolution apres unpersist de df_solved, avec des resultats qui
+    # peuvent differer pour les groupes arretes par la limite de temps.
+    # L'appelant peut liberer la memoire avec df_detail.unpersist().
+    df_detail = df_detail.cache()
+    df_detail.count()
+
+    # --- 8. Ecriture ---
+    if cfg.save_results:
+        log.info(f"  Ecriture: {cfg.output_table}")
+        df_detail.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(cfg.output_table)
+    else:
+        log.info("  save_results=False (mode test)")
+
+    # --- 9. Post-processing ---
+    t_pp = time.time()
+    df_stats, df_coherence = postprocess(spark, df_detail, cfg)
+    timings["postprocess"] = time.time() - t_pp
+
+    if cfg.save_results:
+        df_stats.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(cfg.output_stats_table)
+        if df_coherence is not None:
+            df_coherence.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(cfg.output_coherence_table)
+        log.info(f"  Stats: {cfg.output_stats_table}")
+        log.info(f"  Coherence: {cfg.output_coherence_table}")
+
+    # --- 10. Resume ---
+    total_time = time.time() - t_start
+    taux = n_lettres / max(nb_total, 1) * 100
+    log.info("")
+    log.info("=" * 70)
+    log.info("  RESUME PIPELINE")
+    log.info("=" * 70)
+    log.info(f"  Input       : {nb_total:,} postes")
+    log.info(f"  Lettres     : {n_lettres:,} ({taux:.1f}%)  dont EXACT {n_exact:,}")
+    log.info(f"  A_REVOIR    : {n_a_revoir:,}")
+    log.info(f"  RESIDUEL    : {n_resid:,}")
+    log.info(f"  NON_TRAITE  : {n_nt:,}")
+    log.info(f"  Duree totale : {total_time:.0f}s ({total_time/60:.1f} min)")
+    log.info("=" * 70)
+
+    # --- 11. Sauvegarder historique du run ---
+    if cfg.save_results:
+        _save_run_history(spark, cfg, {
+            "nb_input": nb_total,
+            "nb_cp_sat": n_cpsat,
+            "nb_residuel": n_resid,
+            "nb_non_traite": n_nt,
+            "nb_exact": n_exact,
+            "nb_a_revoir": n_a_revoir,
+            "nb_paquets": n_paquets,
+            "nb_paquets_non_prouves": n_non_prouves,
+            "nb_budget_depasse": n_budget,
+            "taux_pct": taux,
+            "duree_total_s": total_time,
+            "duree_chargement_s": timings.get("chargement", 0),
+            "duree_solve_s": timings.get("solve", 0),
+            "duree_postprocess_s": timings.get("postprocess", 0),
+            "n_groupes": n_groups,
+            "n_partitions": n_partitions,
+            "groupes_par_sec": n_groups / max(timings.get("solve", 1), 0.1),
+        })
+
+    df_solved.unpersist()
+    return df_detail, df_stats, df_coherence
